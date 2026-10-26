@@ -217,6 +217,35 @@ int64_t monotonic_ns() {
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// 呈现分段计时（诊断用，常开）。
+//
+// 引擎的 NVN PERF 把整段 present 记成一个数（present_cpu_ms），但一次 present 里有五件
+// 完全不同的事：等一个空闲交换链缓冲、等上一次提交真的做完、录制 blit、提交、以及
+// vkQueuePresentKHR 里等合成器收走。不拆开就分不清那 1~13ms 是在等面板（正常节拍）还是
+// 在等 GPU（真瓶颈）。全部只在本线程累加，不加重试锁；每 kSplitReport 帧打一行。
+struct PresentSplitStats {
+    uint64_t acquire_ns = 0;   // vkAcquireNextImageKHR
+    uint64_t fence_ns = 0;     // vkWaitForFences(present_fence)
+    uint64_t record_ns = 0;    // 录制 blit 到 vkEndCommandBuffer
+    uint64_t submit_ns = 0;    // vkQueueSubmit
+    uint64_t queue_ns = 0;     // vkQueuePresentKHR
+    uint64_t frames = 0;
+    int64_t record_start = 0;  // 本帧录制起点，submit_present 用它结算 record 段
+};
+PresentSplitStats present_split;
+constexpr uint64_t kSplitReport = 120;
+
+void report_present_split() {
+    if (++present_split.frames < kSplitReport) return;
+    const double f = double(present_split.frames) * 1e6;   // ns / f = 毫秒每帧
+    ot2_host_log("D2R PRESENT split_ms/frame acquire=%.2f fence=%.2f record=%.2f submit=%.2f queue=%.2f "
+                 "frames=%llu",
+                 double(present_split.acquire_ns) / f, double(present_split.fence_ns) / f,
+                 double(present_split.record_ns) / f, double(present_split.submit_ns) / f,
+                 double(present_split.queue_ns) / f, (unsigned long long)present_split.frames);
+    present_split = PresentSplitStats{};
+}
+
 void record_present_timing() {
     const int64_t now = monotonic_ns();
     std::lock_guard lock(frame_mutex);
@@ -431,6 +460,14 @@ UvRect source_uv(uint32_t width, uint32_t height, const int32_t crop[4]) {
 int submit_present(uint32_t index, uint32_t width, uint32_t height,
                    const int32_t crop[4], int32_t sx, int32_t sy, int32_t sw, int32_t sh);
 
+// 实验开关 gfx-1to1 的开关值（见 present_to_surface 内的说明）。默认关闭：
+// 标记文件不存在时保持 false，行为与未打补丁时完全一致。在 vkhost_configure_package
+// 里求值，因为 swapchain 可能在引擎启动之前就建好了（那时 shader_directory 还是空串）。
+bool present_1to1 = false;
+// [diag] 见 present_to_surface 里的用法：把上屏放大 blit 摘掉，只用于归因测量。
+// [diag] See its use in present_to_surface: drops the upscale blit for attribution only.
+bool no_present_blit = false;
+
 int present_to_surface(void *userdata, void *native_window, VkImage image, VkFormat format,
                        uint32_t width, uint32_t height, const int32_t crop[4], int32_t interval) {
     (void)userdata;
@@ -439,6 +476,35 @@ int present_to_surface(void *userdata, void *native_window, VkImage image, VkFor
     (void)interval;
     if (suspend_present || !window) return 0;   // Dropped frame, not an error.
     std::lock_guard lock(state_mutex);
+
+    // 先把 crop 算出来：下面建 swapchain 之前就要用到它的大小。
+    // Compute the crop first: the swapchain size depends on it in the 1:1 mode.
+    int32_t sx = 0, sy = 0;
+    int32_t sw = int32_t(width), sh = int32_t(height);
+    if (crop && crop[2] > 0 && crop[3] > 0) {
+        sx = std::clamp(crop[0], 0, sw);
+        sy = std::clamp(crop[1], 0, sh);
+        sw = std::min(crop[2], int32_t(width) - sx);
+        sh = std::min(crop[3], int32_t(height) - sy);
+    }
+    if (sw <= 0 || sh <= 0) return 0;
+
+    // 实验开关 gfx-1to1（默认关闭）：把上屏缓冲改成与 crop 同尺寸，让全屏放大交给
+    // 合成器做。现在每帧是 guest 出 1280x720 → 我们先 GPU 放大到 2560x1440 → 合成器
+    // 再放大到 2560x1600，同一批源像素被重采样两次；1:1 上屏可以整块省掉第一次放大
+    // 的填充率。chain 在引擎启动前就按窗口尺寸建好了（vkhost_init），那时还不知道
+    // crop，所以要在这里做一次：改缓冲尺寸 → 丢掉旧 chain → 下面按新尺寸重建。
+    // 标记缺失时 present_1to1 恒为 false，行为与未打补丁时完全一致。
+    static bool one_to_one_applied = false;
+    if (present_1to1 && !one_to_one_applied) {
+        one_to_one_applied = true;
+        const int ww = ANativeWindow_getWidth(window), wh = ANativeWindow_getHeight(window);
+        const int rc = (sw < ww && sh < wh) ? ANativeWindow_setBuffersGeometry(window, sw, sh, 0) : -1;
+        ot2_host_log("D2R PRESENT_1TO1 surface %dx%d crop %dx%d rc=%d -> buffer %dx%d",
+                     ww, wh, sw, sh, rc, ANativeWindow_getWidth(window), ANativeWindow_getHeight(window));
+        if (rc == 0) { destroy_swapchain(); destroy_surface(); }
+    }
+
     if (!swapchain) {
         // The window is back but the chain is not. Rebuild here instead of
         // reporting failure: the engine treats a non-zero return as fatal
@@ -452,17 +518,8 @@ int present_to_surface(void *userdata, void *native_window, VkImage image, VkFor
         if (!create_surface_and_swapchain() || !swapchain) return 0;
     }
 
-    int32_t sx = 0, sy = 0;
-    int32_t sw = int32_t(width), sh = int32_t(height);
-    if (crop && crop[2] > 0 && crop[3] > 0) {
-        sx = std::clamp(crop[0], 0, sw);
-        sy = std::clamp(crop[1], 0, sh);
-        sw = std::min(crop[2], int32_t(width) - sx);
-        sh = std::min(crop[3], int32_t(height) - sy);
-    }
-    if (sw <= 0 || sh <= 0) return 0;
-
     uint32_t index = 0;
+    const int64_t split_acquire = monotonic_ns();
     VkResult acquired = vkAcquireNextImageKHR(device, swapchain, 100000000ULL, VK_NULL_HANDLE, present_fence, &index);
     if (acquired == VK_TIMEOUT || acquired == VK_NOT_READY) return 0;
     if (acquired == VK_ERROR_OUT_OF_DATE_KHR) return 0;   // Rebuilt on the next present.
@@ -474,8 +531,13 @@ int present_to_surface(void *userdata, void *native_window, VkImage image, VkFor
         return 0;
     }
     if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return 0;   // Dropped frame.
+    const int64_t split_fence = monotonic_ns();
+    present_split.acquire_ns += uint64_t(split_fence - split_acquire);
     check(vkWaitForFences(device, 1, &present_fence, VK_TRUE, UINT64_MAX), "present fence");
     check(vkResetFences(device, 1, &present_fence), "present fence reset");
+    const int64_t split_record = monotonic_ns();
+    present_split.fence_ns += uint64_t(split_record - split_fence);
+    present_split.record_start = split_record;
 
     check(vkResetCommandBuffer(present_command, 0), "present command reset");
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -655,6 +717,11 @@ int present_to_surface(void *userdata, void *native_window, VkImage image, VkFor
     }
     blit.dstOffsets[0] = {dx, dy, 0};
     blit.dstOffsets[1] = {dx + dw, dy + dh, 1};
+    // [diag] gfx-no-present-blit：跳过每帧的上屏放大 blit，只用来把这块 GPU/CPU 成本从帧时间里
+    // 摘出来量。画面会停在旧内容上，属纯测量开关，不进正式版本。
+    // [diag] gfx-no-present-blit skips the per-frame upscale blit so its cost can be attributed. The screen
+    // keeps showing stale content; measurement only.
+    if (!no_present_blit)
     vkCmdBlitImage(present_command, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    swapchain_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
 
@@ -786,6 +853,19 @@ bool create_surface_and_swapchain() {    if (!window) return false;
 
     VkSwapchainCreateInfoKHR create{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     create.surface = surface;
+    // 队列深度：保持驱动给的 caps.minImageCount（Adreno 通常 3 张）。
+    //
+    // 2026-10-26 曾试过 minImageCount+2（撑到 5 张）以期让提交与执行跨帧重叠，
+    // NP02J 主菜单同场景 A/B 结果是无差别，已回退：
+    //     深度 3：present_cpu 1.77~1.86ms  queue 1.28ms  fps 50.2~50.4
+    //     深度 5：present_cpu 1.85~1.91ms  queue 1.19~1.35ms  fps 50.1~50.4
+    // 原因：本机 present 阻塞本来就只有 1.2~1.3ms，不在关键路径上；+2 张反而多约
+    // 一帧输入延迟。结论——present 不是 NP02J 的瓶颈，不要再往这里投入。
+    //
+    // ⚠ 改这一行之前先看清后端：graphics/backend.cpp 里有一份几乎复制粘贴的交换链
+    //   创建代码，那是 ot2 后端的实现。native/CMakeLists.txt 按 S2A_GRAPHICS_BACKEND
+    //   二选一编译，d2r 后端下 backend.cpp 根本不参与编译。只改那边等于没改
+    //   （本项曾因此空转一轮，误把无关的测量波动当成收益）。
     create.minImageCount = std::max(2u, caps.minImageCount);
     if (caps.maxImageCount) create.minImageCount = std::min(create.minImageCount, caps.maxImageCount);
     create.imageFormat = chosen.format;
@@ -973,7 +1053,11 @@ int submit_present(uint32_t index, uint32_t width, uint32_t height,
     submit.pCommandBuffers = &present_command;
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &present_done;
+    const int64_t split_submit = monotonic_ns();
+    if (present_split.record_start) present_split.record_ns += uint64_t(split_submit - present_split.record_start);
     check(vkQueueSubmit(queue, 1, &submit, present_fence), "present submit");
+    const int64_t split_queue = monotonic_ns();
+    present_split.submit_ns += uint64_t(split_queue - split_submit);
 
     VkPresentInfoKHR info{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     info.waitSemaphoreCount = 1;
@@ -982,10 +1066,12 @@ int submit_present(uint32_t index, uint32_t width, uint32_t height,
     info.pSwapchains = &swapchain;
     info.pImageIndices = &index;
     VkResult result = vkQueuePresentKHR(queue, &info);
+    present_split.queue_ns += uint64_t(monotonic_ns() - split_queue);
     if (result == VK_ERROR_OUT_OF_DATE_KHR) {
         vkQueueWaitIdle(queue);
         // Rebuild lazily: the surface size is read again on the next present.
         destroy_swapchain();
+        report_present_split();
         return 0;
     }
     // VK_SUBOPTIMAL_KHR is not a reason to rebuild here. This host presents with
@@ -1004,9 +1090,11 @@ int submit_present(uint32_t index, uint32_t width, uint32_t height,
         if (result == VK_ERROR_SURFACE_LOST_KHR) destroy_surface();
         destroy_swapchain();
         ot2_host_log("D2R present failed: %d (frame dropped, chain rebuilt)", int(result));
+        report_present_split();
         return 0;
     }
     record_present_timing();
+    report_present_split();
     const uint64_t count = ++presented;
     if (count == 1 || count % 100 == 0)
         ot2_host_log("D2R present n=%llu source=%ux%u crop=%d,%d %dx%d rotation=%d surface=%ux%u",
@@ -1030,6 +1118,14 @@ extern "C" void vkhost_configure_package(const char *path, const char *offline) 
     // directory, which is how the rest of this host's diagnostics are found too.
     bundle_directory = shader_directory + "/vk";
     flip_present = std::filesystem::exists(shader_directory + "/present-flip-y");
+    // gfx-1to1：把上屏缓冲改成 crop 尺寸，让放大交给合成器，省掉每帧一次全屏放大 blit。
+    // 标记缺失时保持 false，与未打补丁时完全一致。
+    present_1to1 = std::filesystem::exists(shader_directory + "/gfx-1to1") ||
+                   std::filesystem::exists(shader_directory + "/vk/gfx-1to1");
+    ot2_host_log("D2R present_1to1=%d (marker gfx-1to1)", present_1to1 ? 1 : 0);
+    no_present_blit = std::filesystem::exists(shader_directory + "/gfx-no-present-blit") ||
+                      std::filesystem::exists(shader_directory + "/vk/gfx-no-present-blit");
+    if (no_present_blit) ot2_host_log("D2R [diag] present upscale blit skipped (marker gfx-no-present-blit)");
     // Orientation: the swapchain is created with preTransform = IDENTITY at the
     // window's own size, which is what makes the compositor apply the display's
     // rotation exactly once. The picture is therefore already upright by the time

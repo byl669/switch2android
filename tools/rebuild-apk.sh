@@ -73,6 +73,29 @@ PY
 fi
 [ -f "$ASSETS/launch.json" ] || { echo "no launch.json (installed APK and product dir both empty)" >&2; exit 1; }
 
+# d2r 引擎只在 <files>/games/<title>/shaders/vk 里找 <key>.xgs，game.s2a 里那份
+# .spv/.res.json 运行时一个都不读。这些包不随资产发布，空白设备一进 compute dispatch
+# 就会 "Dispatch has no genuine compute shader" 直接退出，所以必须打进 APK。
+# 生成：tools/pack-shader-bundles.sh
+BUNDLES=${S2A_SHADER_BUNDLES:-$WORKSPACE/s2a-work/shader-bundles.zip}
+if [ -f "$BUNDLES" ]; then
+    cp "$BUNDLES" "$ASSETS/shader-bundles.zip"
+    echo "bundles: $BUNDLES ($(wc -c <"$BUNDLES" | tr -d ' ') bytes)"
+else
+    echo "warning: $BUNDLES 缺失 —— 这个 APK 装到空白设备上会因缺着色器闪退" >&2
+fi
+
+# 中文替换字体：native/shared_font.cpp 只在 <files>/games/<title>/ 里找它，系统字体
+# 没有中文字形，缺了就是满屏 "?"。以前靠手工 adb push，卸载重装即失，现在随包发。
+# 源文件由 tools/make-shared-font.sh 生成。
+FONT=${S2A_SHARED_FONT:-$ROOT/assets/shared-font.otf}
+if [ -f "$FONT" ]; then
+    cp "$FONT" "$ASSETS/shared-font.otf"
+    echo "font:   $FONT ($(wc -c <"$FONT" | tr -d ' ') bytes)"
+else
+    echo "warning: $FONT 缺失 —— 这个 APK 装到空白设备上中文会显示成 ?" >&2
+fi
+
 NAME=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["name"])' "$ASSETS/launch.json")
 # The installed version code is authoritative: launch.json records the game's
 # own version, not the APK revision, so deriving the code from it produces a

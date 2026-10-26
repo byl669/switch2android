@@ -19,8 +19,10 @@ final class FrameRatePolicy {
         boolean saving=power!=null&&power.isPowerSaveMode();
         try{saving|=game!=null&&game.getGameMode()==GameManager.GAME_MODE_BATTERY;}
         catch(RuntimeException unavailable){/* OEM without game service. */}
-        // Default to 30 in every system mode until stability and energy beat
-        // the emulator. The 60-FPS experiment now requires explicit opt-in.
-        target=saving||force30.exists()||!experimental60.exists()?30:60;return target;
+        // This title advances guest logic as fps/60: presenting below 60 is a
+        // slow-motion game, not a power saving. Claim 60 so the compositor keeps
+        // the display at 60 Hz instead of arbitrating down to 30. force-30-fps
+        // stays as an explicit opt-in for measurement only.
+        target=saving||force30.exists()?30:60;return target;
     }
 }

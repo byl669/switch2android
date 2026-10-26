@@ -50,6 +50,11 @@ uint64_t ot2_host_stack_call(uint64_t (*)(uint64_t*),uint64_t*,uintptr_t);
 // Sampling signal for the watchdog; kept away from SIGUSR1, which ART owns.
 static const int OT2_SAMPLE_SIGNAL=SIGRTMIN+4;
 extern "C" { extern int32_t ot2_guest_tids[GuestThreadCapacity]; }
+// 诊断计数：guest 总共调用了多少次 svcGetSystemTick（SVC 0x1e）。
+// 必须定义在匿名命名空间之外——匿名命名空间是内部链接，xbg_game.cpp 链接不到
+// （已踩过一次：ld.lld undefined symbol ot2_sys_tick_calls）。
+// 用途见 ticks()：判定游戏内时间是由真实时间驱动，还是由帧数驱动。
+std::atomic<uint64_t> ot2_sys_tick_calls{0};
 namespace {
 struct Trap { uintptr_t pc; uint32_t instruction; const char* hook; uint64_t (*call)(uint64_t*)=nullptr; uint64_t hits=0; };
 std::vector<Trap> traps;
@@ -1318,7 +1323,7 @@ void svc(unsigned id,ucontext_t* uc,GuestThread* c) {
         }
     }
     if(id<256 && !seen[id]) { seen[id]=true; log("SVC 0x%x x0=%llx x1=%llx x2=%llx x3=%llx",id,r[0],r[1],r[2],r[3]); }
-    if(id==0x1e) { r[0]=ticks(); return; }
+    if(id==0x1e) { ot2_sys_tick_calls.fetch_add(1,std::memory_order_relaxed); r[0]=ticks(); return; }
     if(id==0x15 || id==0x51 || id==0x52) {
         std::lock_guard lock(mapping_mutex);
         const uintptr_t address=r[1];const size_t length=r[2];const uint32_t handle=r[0],permission=r[3];

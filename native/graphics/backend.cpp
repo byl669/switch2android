@@ -1927,14 +1927,21 @@ static void present_frame(const tex_t* texture,int interval,const int* crop,uint
         if(!format.format)ot2_host_die("Surface lacks a display-encoded UNORM format");swapchain_format=format.format;
         swapchain_extent=caps.currentExtent;
         if(swapchain_extent.width==UINT32_MAX)swapchain_extent={uint32_t(ANativeWindow_getWidth(window)),uint32_t(ANativeWindow_getHeight(window))};
-        VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};ci.surface=surface;ci.minImageCount=std::max(2U,caps.minImageCount);
-        if(caps.maxImageCount)ci.minImageCount=std::min(ci.minImageCount,caps.maxImageCount);
+        VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};ci.surface=surface;
+        // 队列深度：+2 张（撑到 5 张）。注意本文件属于 ot2 后端，native/CMakeLists.txt
+        // 按 S2A_GRAPHICS_BACKEND 与 graphics/d2r_bridge.cpp 二选一编译；当前交付走 d2r
+        // 后端，所以这里的改法对发布包没有任何影响。d2r 后端对应的那份交换链在
+        // d2r_bridge.cpp 内，那里 2026-10-26 的 A/B 结论是「+2 无收益、回退默认」。
+        // 两处保持一致，避免下次又只改一边。
+        uint32_t depth=caps.minImageCount+2;if(caps.maxImageCount)depth=std::min(depth,caps.maxImageCount);
+        ci.minImageCount=std::max(2U,depth);
         ci.imageFormat=format.format;ci.imageColorSpace=format.colorSpace;ci.imageExtent=swapchain_extent;ci.imageArrayLayers=1;ci.imageUsage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if(!(caps.supportedTransforms&VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR))ot2_host_die("Surface lacks compositor rotation support");
         ci.preTransform=VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
         ot2_host_log("SURFACE_TRANSFORM current=%u supported=%u compositor=identity",caps.currentTransform,caps.supportedTransforms);ci.compositeAlpha=VkCompositeAlphaFlagBitsKHR(caps.supportedCompositeAlpha&(~caps.supportedCompositeAlpha+1));ci.presentMode=VK_PRESENT_MODE_FIFO_KHR;ci.clipped=VK_TRUE;
         check(vkCreateSwapchainKHR(device,&ci,nullptr,&swapchain),"swapchain");reset_display_timings();
         check(vkGetSwapchainImagesKHR(device,swapchain,&n,nullptr),"swapchain images");swapchain_images.resize(n);check(vkGetSwapchainImagesKHR(device,swapchain,&n,swapchain_images.data()),"swapchain images");
+        ot2_host_log("SWAPCHAIN images=%u min=%u max=%u extent=%ux%u",n,caps.minImageCount,caps.maxImageCount,swapchain_extent.width,swapchain_extent.height);
         swapchain_views.resize(n);for(unsigned i=0;i<n;i++){VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};vi.image=swapchain_images[i];vi.format=swapchain_format;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};check(vkCreateImageView(device,&vi,nullptr,&swapchain_views[i]),"display image view");}
     }
     if(!drawable_acquire_fence){VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};check(vkCreateFence(device,&fi,nullptr,&drawable_acquire_fence),"acquire fence");}

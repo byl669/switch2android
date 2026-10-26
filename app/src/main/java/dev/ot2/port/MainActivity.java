@@ -214,6 +214,13 @@ public final class MainActivity extends Activity implements InputManager.InputDe
     private static native void cancelNativeTouch();
     private GameInputView gameInput;
     private PadToggleView padToggle;
+    // 性能面板默认隐藏：它固定在左上角，正好压住本作自己的倒计时与题面抬头。诊断要一次手势就能拿到，
+    // 但默认不能占着画面 —— 所以由 HudToggleView 那个悬浮把手显式打开。
+    // The HUD starts hidden: it is pinned to the top-left, which is exactly where this
+    // title draws its countdown and question header. It stays one gesture away behind
+    // the HudToggleView handle instead of covering the picture by default.
+    private HudToggleView hudToggle;
+    private boolean hudVisible;
     private long virtualButtons;
     private int virtualLx,virtualLy,virtualRx,virtualRy;
     private long keyButtons,axisButtons;
@@ -292,11 +299,30 @@ public final class MainActivity extends Activity implements InputManager.InputDe
             toggle.setLayoutParams(params);
         }});
     }
+    // Directly under the pad handle, same right edge: the two controls sit in one column so
+    // neither has to be hunted for, and a player who drags one out of the way does not take
+    // the other with it.
+    private void placeHudToggle(FrameLayout root,HudToggleView toggle){
+        final int margin=Math.round(10*getResources().getDisplayMetrics().density);
+        final int gap=Math.round(8*getResources().getDisplayMetrics().density);
+        root.post(new Runnable(){@Override public void run(){
+            if(isDestroyed()||root.getWidth()<=0){if(!isDestroyed())root.postDelayed(this,50);return;}
+            android.view.WindowInsets insets=root.getRootWindowInsets();
+            android.graphics.Insets safe=insets==null?null:insets.getInsets(android.view.WindowInsets.Type.displayCutout());
+            int letterbox=Math.max(0,(root.getHeight()-Math.round(root.getWidth()*9f/16f))/2);
+            FrameLayout.LayoutParams params=(FrameLayout.LayoutParams)toggle.getLayoutParams();
+            params.leftMargin=Math.max(0,root.getWidth()-toggle.getWidth()-margin-(safe==null?0:safe.right));
+            int top=letterbox+margin+(safe==null?0:safe.top);
+            int padHeight=padToggle!=null && padToggle.getHeight()>0?padToggle.getHeight():Math.round(46*getResources().getDisplayMetrics().density);
+            params.topMargin=top+padHeight+gap;
+            toggle.setLayoutParams(params);
+        }});
+    }
     @Override public void onInputDeviceAdded(int id) {refreshController();}
     @Override public void onInputDeviceChanged(int id) {if(id==controllerId)releaseInput();refreshController();}
     @Override public void onInputDeviceRemoved(int id) {if(id==controllerId){releaseInput();controllerId=-1;}refreshController();}
     @Override protected void onStart(){super.onStart();activitySession.start(this);}
-    @Override protected void onResume(){super.onResume();resumed=true;refreshAutomationInput();getSystemService(InputManager.class).registerInputDeviceListener(this,null);activitySession.resume(this,hasWindowFocus());refreshController();noticeHandler.post(noticePoll);if(performanceHud!=null)performanceHud.start();}
+    @Override protected void onResume(){super.onResume();resumed=true;refreshAutomationInput();getSystemService(InputManager.class).registerInputDeviceListener(this,null);activitySession.resume(this,hasWindowFocus());refreshController();noticeHandler.post(noticePoll);if(performanceHud!=null&&hudVisible)performanceHud.start();}
     @Override public void onWindowFocusChanged(boolean focused){super.onWindowFocusChanged(focused);if(resumed){activitySession.focus(this,focused);if(!focused)releaseInput();}}
     @Override protected void onPause(){resumed=false;noticeHandler.removeCallbacks(noticePoll);if(performanceHud!=null)performanceHud.stop();if(saveDialog!=null)saveDialog.dismiss();if(textDialog!=null)textDialog.dismiss();getSystemService(InputManager.class).unregisterInputDeviceListener(this);activitySession.pause(this);releaseInput();super.onPause();}
     @Override protected void onStop(){activitySession.stop(this);super.onStop();}
@@ -333,6 +359,15 @@ public final class MainActivity extends Activity implements InputManager.InputDe
             FrameLayout root=new FrameLayout(this);
             bootRoot=root;
             SurfaceView surface=new SurfaceView(this);
+            // gfx-half-present（默认开启，标记 shaders/no-half-present 关闭）：上屏缓冲按
+            // 屏幕的一半分配，2 倍放大交给合成器。现在 guest 出 1280x720，我们要先在 GPU
+            // 里放大成 2560x1600，合成器再放大到屏幕上 —— 同一批像素被重采样两次，占掉单帧
+            // 预算里最大的一块填充率（实测 GPU 13.0ms 里有 5.5ms 是它）。缓冲减半后本机只写
+            // 1/4 的像素，由合成器做整数 2 倍放大，画质不变。屏幕不够大时保持原尺寸。
+            android.util.DisplayMetrics metrics=getResources().getDisplayMetrics();
+            if(metrics.widthPixels>=2560&&metrics.heightPixels>=1440
+                    &&!new File(getFilesDir(),"shaders/no-half-present").exists())
+                surface.getHolder().setFixedSize(metrics.widthPixels/2,metrics.heightPixels/2);
             root.addView(surface,new FrameLayout.LayoutParams(-1,-1));
             layout.removeAllViews();scroll.removeView(status);
             layout.setBackgroundColor(Color.TRANSPARENT);status.setTextSize(12);
@@ -348,6 +383,7 @@ public final class MainActivity extends Activity implements InputManager.InputDe
             FrameLayout.LayoutParams hudParams=new FrameLayout.LayoutParams(-2,-2,android.view.Gravity.TOP|android.view.Gravity.START);
             int margin=Math.round(12*getResources().getDisplayMetrics().density);
             hudParams.setMargins(margin,margin,margin,margin);root.addView(performanceHud,hudParams);
+            performanceHud.setVisibility(View.GONE);   // off until the handle asks for it
             performanceHud.setOnApplyWindowInsetsListener((view,insets)->{
                 android.graphics.Insets safe=insets.getInsets(android.view.WindowInsets.Type.displayCutout());
                 FrameLayout.LayoutParams p=(FrameLayout.LayoutParams)view.getLayoutParams();
@@ -361,6 +397,17 @@ public final class MainActivity extends Activity implements InputManager.InputDe
             });
             root.addView(padToggle,new FrameLayout.LayoutParams(-2,-2,android.view.Gravity.TOP|android.view.Gravity.START));
             placePadToggle(root,padToggle);
+            // 第二个悬浮把手，管性能面板的显隐；交互方式与上面那个虚拟按键开关完全一致。
+            // A second handle, for the HUD, with exactly the same gesture model as the pad switch above.
+            hudToggle=new HudToggleView(this,on->{
+                hudVisible=on;
+                if(performanceHud!=null){
+                    performanceHud.setVisibility(on?View.VISIBLE:View.GONE);
+                    if(on)performanceHud.start();else performanceHud.stop();
+                }
+            });
+            root.addView(hudToggle,new FrameLayout.LayoutParams(-2,-2,android.view.Gravity.TOP|android.view.Gravity.START));
+            placeHudToggle(root,hudToggle);
             surface.getHolder().addCallback(new SurfaceHolder.Callback() {
                 @Override public void surfaceCreated(SurfaceHolder holder) {
                     synchronized(surfaceLock){frameRateSurface=null;activeHolder=holder;setNativeSurface(holder.getSurface());}
@@ -416,6 +463,16 @@ public final class MainActivity extends Activity implements InputManager.InputDe
             try {
                 long started=android.os.SystemClock.elapsedRealtime();
                 GameProfile profile=GameProfile.select(context,title);
+                // d2r 只从私有目录读着色器包，game.s2a 里那份运行时不读，所以首启
+                // （含卸载重装）要在这儿把它们铺好，否则一进 compute dispatch 就
+                // "Dispatch has no genuine compute shader" 直接退出。
+                ShaderBundles.install(context,profile.privateRoot,Session::publish);
+                // 管线预热列表的种子：让新设备在第一场对战前就把常见管线建好，
+                // 而不是在战斗中边玩边编译。没有列表（全新安装）时才由引擎采用。
+                PipelineSeed.install(context,profile.privateRoot,Session::publish);
+                // 同理：中文替换字体也只在私有目录里找，系统字体没有中文字形，
+                // 缺了就是满屏 "?"。卸载重装会连它一起删，所以也要首启铺回去。
+                SharedFont.install(context,profile.privateRoot,Session::publish);
                 File directory=new File(profile.gameRoot,"ExeFS");
                 String validation=profile.validateModules();
                 long verified=android.os.SystemClock.elapsedRealtime();

@@ -95,6 +95,12 @@ typedef struct { uint32_t stride, divisor; } vs_st;                             
 
 // ---------- 命令记录：{op, size（含头，8 对齐）} + 载荷 ----------
 // ---------- Command records: {op, size (including header, aligned to 8)} + payload ----------
+//
+// 这些编号是**跨宿主的线上格式**：d2r 的 Vulkan 回放（native/d2r）按同一张表
+// 解我们写出的记录。所以 0–48 与上游 d2r-mobile 逐个对齐，本宿主独有的语义
+// （FENCE / WAIT_SYNC / DEPTH_BOUNDS / SAMPLE_MASK / RENDER_ENABLE / LINE_WIDTH）
+// 一律排在 49 之后——回放遇到它们按无操作跳过，绝不与上游的 op 混号。
+// 上游有而本宿主不写的 42–44、46 保留占位，防止将来错位。
 typedef struct { uint32_t op, size; } op_hdr;
 enum {
     OP_END, OP_JUMP, OP_BEGIN, OP_CALL,
@@ -103,7 +109,24 @@ enum {
     OP_BIND_PROGRAM, OP_BIND_STATE, OP_BIND_VATTR, OP_BIND_VSTREAM, OP_BIND_VBUF,
     OP_BIND_UBO, OP_BIND_SSBO, OP_BIND_TEX, OP_BIND_SAMP,
     OP_STENCIL, OP_POLY_OFFSET, OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BARRIER,
-    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_FENCE, OP_CLEAR_BUFFER, OP_WAIT_SYNC, OP_DEPTH_BOUNDS, OP_COPY_IMAGE_STRIDE, OP_SAMPLE_MASK, OP_RASTER_DISCARD, OP_DEPTH_CLAMP, OP_RENDER_ENABLE, OP_LINE_WIDTH, OP_COUNT_
+    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX,
+    // ---- 以下与上游 d2r-mobile 同号，回放直接消费 ----
+    OP_CLEAR_BUFFER, OP_DEPTH_CLAMP, OP_RENDER_COND,                              // 39 40 41
+    OP_FENCE_SYNC, OP_TF_BIND, OP_TF_STATE,                                       // 42 43 44 上游写，本宿主不写 | upstream only; this host never records these
+    OP_RASTER_DISCARD,                                                            // 45
+    OP_VP_SWIZZLE,                                                                // 46 上游写，本宿主不写 | upstream only
+    OP_BIND_TEX1, OP_COPY_IMAGE_STRIDE,                                           // 47 48
+    // ---- 扩展段：回放按 OP_COUNT_+n 认领（见 xbg_game.cpp 的 switch） ----
+    // 回放的 OP_COUNT_ 是 49，所以 +1..+9 就是 50..58；我们只写 +5（深度边界），
+    // 载荷与回放的 xbg_depth_bounds 同形。其余留空，别占。
+    // The replay's OP_COUNT_ is 49, so its +n slots are 50..58; only +5 (depth
+    // bounds) is recorded here, with a payload identical to xbg_depth_bounds.
+    OP_EXT_RESERVED_50 = 50, OP_EXT_RESERVED_51, OP_EXT_RESERVED_52, OP_EXT_RESERVED_53,
+    OP_DEPTH_BOUNDS,                                                              // 54 = OP_COUNT_+5
+    OP_EXT_RESERVED_55, OP_EXT_RESERVED_56, OP_EXT_RESERVED_57, OP_EXT_RESERVED_58,
+    // ---- 本宿主独有：回放没有 case，按无操作跳过（见 d2r 白名单） ----
+    OP_FENCE, OP_WAIT_SYNC, OP_SAMPLE_MASK, OP_RENDER_ENABLE, OP_LINE_WIDTH,       // 59..63
+    OP_COUNT_
 };
 // 载荷（紧跟 op_hdr）
 // Payload (immediately follows op_hdr)
@@ -113,6 +136,12 @@ typedef struct { float depth; int32_t depth_mask, stencil, stencil_mask; } p_cle
 typedef struct { int32_t first, n; float v[16][6]; } p_viewports;          // x, y, w, h, 近, 远（近远由 DEPTH_RANGE 覆盖） | x, y, w, h, near, far (near and far are overridden by DEPTH_RANGE)
 typedef struct { int32_t x, y, w, h; } p_scissor;
 typedef struct { float n, f; } p_depth_range;
+// Conditional render: mode 0 renders when the two counters are equal, mode 1 when
+// they differ (NVN_CONDITIONAL_RENDER_MODE_RENDER_IF_EQUAL / _RENDER_IF_NOT_EQUAL).
+// The counters are the `counter` field of the NVNcounterData at addr and addr+16,
+// so a title brackets work with two samples-passed reports and asks whether any
+// pixel got through in between.
+typedef struct { int32_t mode, pad; uint64_t addr; } p_render_cond;
 typedef struct { uint32_t enable;float minimum,maximum; } p_depth_bounds;
 typedef struct { const prog_t *prog; int32_t stages; } p_bind_program;
 typedef struct { int32_t kind; uint8_t bytes[0x18]; } p_bind_state;      // kind：0 blend 1 color 2 chmask 3 ms 4 poly 5 ds
@@ -120,12 +149,40 @@ typedef struct { int32_t first, n; uint32_t st[16]; } p_bind_vattr;
 typedef struct { int32_t first, n; vs_st st[16]; } p_bind_vstream;
 typedef struct { int32_t first, n; NVNbufferRange r[16]; } p_bind_vbuf;
 typedef struct { int32_t stage, index; uint64_t addr, size; } p_bind_buf;  // UBO / SSBO
-typedef struct { int32_t stage, first, n; uint64_t h[32]; } p_bind_handles; // 分离贴图 / 采样器句柄 | Separate texture / sampler handles
+// 分离贴图 / 采样器句柄。defer / src 是「句柄写在客体内存、记录只给地址」的形态：
+// 本宿主直接按值写 h（defer = 0），这两个字段放在 h 之后，既不改 h 的偏移，也不进
+// 记录长度（RECN 只写 offsetof(h) + 8n 字节，回放读到 0 = 不延后）。
+// Separate texture / sampler handles. defer / src are the "handles live in guest
+// memory, the record only names the address" form; this host writes the handles
+// by value (defer = 0). They sit after h so neither h's offset nor the record
+// length changes -- RECN writes offsetof(h) + 8n bytes, so the replay reads 0.
+typedef struct { int32_t stage, first, n; uint64_t h[32]; int32_t defer, pad; uint64_t src; } p_bind_handles;
 typedef struct { int32_t face, value_mask, mask, ref, which; } p_stencil;  // which：0 值掩码 1 写掩码 2 参考值 | which: 0 value mask 1 write mask 2 reference value
 typedef struct { float factor, units, clamp; } p_poly_offset;
-typedef struct { int32_t prim, first, count, base_instance, instances; } p_draw;
-typedef struct { int32_t prim, itype, count, base_vertex, base_instance, instances; uint64_t ibuf; } p_draw_idx;
-typedef struct { int32_t x, y, z; uint64_t caller; } p_dispatch;   // caller：游戏调用点返回地址（定位派发者） | caller: return address of the game call site (to locate the dispatcher)
+// The trailing indirect / multi-draw fields are what the d2r Vulkan replay reads
+// (draw_rec / draw_idx_rec). Our recorder keeps writing the short form -- the
+// record stops at `ind` -- because the game sizes its command memory by what the
+// real driver would have used, and a longer plain draw would eat into per-mesh
+// reservations. The replay zero-fills whatever the record does not carry.
+typedef struct { int32_t prim, first, count, base_instance, instances; uint64_t ind, mdi_cnt; int32_t mdi_i, pad; } p_draw;
+typedef struct { int32_t prim, itype, count, base_vertex, base_instance, instances; uint64_t ibuf, ind, mdi_cnt; int32_t mdi_i, pad; } p_draw_idx;
+typedef struct { int32_t x, y, z; uint64_t caller, ind; } p_dispatch;   // caller：游戏调用点返回地址（定位派发者） | caller: return address of the game call site (to locate the dispatcher)
+// A single combined texture+sampler handle as the game gives it (texture id |
+// sampler id << 20), with the numbering bases of the descriptor pools bound to
+// the command buffer. bind_rec() widens it to a p_bind_handles record. We do not
+// record this form today; the replay supports it so a title that patches its own
+// command memory in place cannot be misread as a huge count.
+typedef struct { int32_t stage, slot; uint64_t h; int32_t tbase, sbase; } p_bind_tex1;
+static inline const p_bind_handles *bind_rec(uint32_t op, const void *a, p_bind_handles *t) {
+    if (op != OP_BIND_TEX1) return (const p_bind_handles *)a;
+    const p_bind_tex1 *b = (const p_bind_tex1 *)a; uint64_t tid = b->h & 0xfffff, sid = (uint32_t)b->h >> 20;
+    t->stage = b->stage; t->first = b->slot; t->n = 1; t->h[0] = (tid ? tid + (uint64_t)b->tbase : 0) | (sid ? sid + (uint64_t)b->sbase : 0) << 20; return t;
+}
+// 记录可能只写了前段（本宿主就是如此）：缺的字段按 0 补，绝不越界读。
+// A record may stop before the trailing fields (our host always does): the
+// missing ones read as 0, never past the end of the record.
+static inline const p_draw *draw_rec(const void *a, uint32_t size, p_draw *t) { if (size - 8 >= sizeof *t) return (const p_draw *)a; memset(t, 0, sizeof *t); memcpy(t, a, size - 8); return t; }
+static inline const p_draw_idx *draw_idx_rec(const void *a, uint32_t size, p_draw_idx *t) { if (size - 8 >= sizeof *t) return (const p_draw_idx *)a; memset(t, 0, sizeof *t); memcpy(t, a, size - 8); return t; }
 typedef struct { const dpool_t *pool; } p_set_pool;
 typedef struct { uint64_t src; const tex_t *tex; view_t view; uint8_t has_view; NVNcopyRegion r; int32_t flags; } p_copy_b2t;
 typedef struct { const tex_t *src, *dst; view_t sv, dv; uint8_t has_sv, has_dv; NVNcopyRegion sr, dr; int32_t flags; } p_copy_t2t;   // T2B 复用：src 存目标缓冲地址 | Reused for T2B: src stores the destination buffer address
@@ -133,3 +190,13 @@ typedef struct { const tex_t *tex; view_t view; uint8_t has_view, is_uint; NVNco
 typedef struct { int64_t stride; } p_copy_stride;
 typedef struct { float rgba[4]; } p_blend_color;
 
+// 初始化序号：贴图 / 程序对象每次 Initialize 取一个新号，回放层按它把对象
+// 认到宿主表里（游戏可能按值拷贝对象，不能存对象指针）。实现见 frontend.c，
+// 声明见 backend.h（extern "C"，d2r_host.c 也用它）。
+// Initialization serial: a texture or program object takes a new number on every
+// Initialize and the replay layer keys its host tables by it (the game may copy
+// the object by value, so object pointers cannot be stored). Implemented in
+// frontend.c, declared in backend.h with C linkage (d2r_host.c uses it too).
+// 合并句柄记录（OP_BIND_TEX1）由游戏自己就地改写命令内存时才出现，本宿主不写。
+// The combined-handle record (OP_BIND_TEX1) only appears when a game rewrites its
+// own command memory in place; this host never writes one.

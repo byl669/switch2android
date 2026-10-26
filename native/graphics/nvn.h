@@ -153,6 +153,18 @@ typedef struct {
     const void* control;
 } NVNshaderData;
 
+// nvnProgramSetShadersExt takes the same pair plus one more 8-byte field per
+// stage, so its array stride is 0x18 rather than 0x10. Reading it as an array of
+// NVNshaderData silently shifts every stage after the first: stage N's "control"
+// becomes stage N-1's extension word and its "data" becomes stage N-1's code
+// pointer. The symptom is a plausible-looking fragment shader whose control
+// section never validates, which is exactly the failure this host showed.
+typedef struct {
+    NVNbufferAddress data;
+    const void* control;
+    uint64_t extension;
+} NVNshaderDataExt;
+
 typedef struct {
     char reserved[0x100];
 } NVNmemoryPool;

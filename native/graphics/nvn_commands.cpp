@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unistd.h>
 #include <set>
 #include <vector>
 #include <functional>
@@ -12,7 +13,43 @@
 namespace {
 // Lock order: command ownership -> backend. Backend must pin before taking its
 // state lock, and release pins after dropping that lock.
-std::mutex mutex;
+// A recording entry can re-enter the guest: running out of command memory asks
+// the title for more, and anything the title touches on the way back in may need
+// this lock again. A plain std::mutex deadlocks silently in that case, which from
+// the outside looks like the title simply stopping. Report the contention before
+// blocking so the cause is visible in the log.
+struct TracedMutex {
+    std::mutex inner;
+    void lock() {
+        // Spin briefly, then back off in microseconds.
+        //
+        // This used to poll with usleep(100000): every contended call then took at
+        // least 100 ms, and a title issuing thousands of commands per frame spent
+        // all its time sitting in that sleep. The symptom looked like a stalled
+        // engine -- frames stopped, memory crept up, every thread parked -- while
+        // the real cause was this diagnostics helper throttling the whole command
+        // path. A short spin covers the common case (the holder is about to
+        // release) and the growing backoff still reports a genuine re-entry.
+        for (int i = 0; i < 100; i++) {
+            if (inner.try_lock()) return;
+#if defined(__aarch64__) || defined(__arm__)
+            asm volatile("yield" ::: "memory");   // let the holding core make progress
+#endif
+        }
+        // ~3 s of 1 ms attempts, reporting only once the wait is noticeable.
+        for (int i = 0; i < 3000; i++) {
+            if (inner.try_lock()) {
+                if (i >= 50) ot2_host_log("NVN_CMDS_MUTEX acquired after %dms", i);
+                return;
+            }
+            usleep(1000);
+        }
+        ot2_host_log("NVN_CMDS_MUTEX blocked >3s: a recording entry re-entered while holding it");
+        inner.lock();
+    }
+    void unlock() { inner.unlock(); }
+};
+TracedMutex mutex;
 struct Texture {
     tex_t value;
     explicit Texture(const tex_t& v):value(v){vkhost_tex_retain(v.serial);}

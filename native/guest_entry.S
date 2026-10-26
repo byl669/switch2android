@@ -264,6 +264,21 @@ ot2_native_generic:
 9:  brk #0x707
 .size ot2_native_entry, .-ot2_native_entry
 
+// Stand-in for a native API the host has no implementation for. It is called
+// with the caller's own arguments already restored, so ignoring them is safe;
+// both result registers are cleared so a caller that reads an integer or a
+// float back sees zero rather than whatever the lookup left behind. Used only
+// in diagnostic mode, where the goal is to reach the next real blocker.
+.global ot2_native_zero
+.hidden ot2_native_zero
+.type ot2_native_zero, %function
+ot2_native_zero:
+    mov x0, xzr
+    fmov d0, xzr
+    fmov s0, wzr
+    ret
+.size ot2_native_zero, .-ot2_native_zero
+
 // Typed scalar-only AAPCS64 calls never have stack arguments. The integer
 // variant also needs no FP argument saves around the native-function lookup.
 // Unknown, aggregate, variadic and stack-argument prototypes use generic above.

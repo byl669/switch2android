@@ -35,6 +35,12 @@ final class GameInputView extends View {
     private final ArrayList<Control> controls=new ArrayList<>();
     private final SparseArray<Pointer> pointers=new SparseArray<>();
     private boolean controllerConnected;
+    // The pad is an assist, not the default input. This title is played with a
+    // finger, and a full set of rings sitting over the picture competes with the
+    // one thing the screen is for. Off means exactly that: nothing painted, and
+    // every touch falls through to the guest as touch. The floating toggle is the
+    // only way in, so the state is explicit rather than guessed from idleness.
+    private boolean padEnabled;
     private float scale=1,originX,originY;
     private int insetLeft,insetTop,insetRight,insetBottom;
     GameInputView(Context context,Sink sink){
@@ -52,7 +58,11 @@ final class GameInputView extends View {
             InputDevice d=InputDevice.getDevice(id);if(d!=null&&gamepadSource(d.getSources(),d.isVirtual()))return true;
         }return false;
     }
-    boolean controlsVisible(){return !controllerConnected;}
+    boolean controlsVisible(){return padEnabled&&!controllerConnected;}
+    boolean setPadEnabled(boolean enabled){
+        if(padEnabled==enabled)return false;
+        cancel();padEnabled=enabled;invalidate();return true;
+    }
     boolean setControllerConnected(boolean connected){
         if(controllerConnected==connected)return false;
         cancel();controllerConnected=connected;invalidate();return true;
@@ -91,7 +101,7 @@ final class GameInputView extends View {
         throw new IllegalArgumentException(label);
     }
     private Control hit(float x,float y){
-        if(controllerConnected)return null;
+        if(!padEnabled||controllerConnected)return null;
         // Explicit buttons take precedence over the expanded floating-stick zone.
         for(Control c:controls)if(c.kind!=LEFT_STICK&&c.contains(x,y))return c;
         for(Control c:controls)if(c.kind==LEFT_STICK&&Math.hypot(x-c.x,y-c.y)<=c.r*1.55f)return c;
@@ -117,7 +127,7 @@ final class GameInputView extends View {
                 sink.touch(up?2:1,id,e.getX(i),e.getY(i),getWidth(),getHeight());
             if(up)pointers.remove(id);
         }
-        publishPad();if(!controllerConnected)invalidate();
+        publishPad();if(controlsVisible())invalidate();
         if(action==MotionEvent.ACTION_UP)performClick();return true;
     }
     @Override public boolean performClick(){super.performClick();return true;}
@@ -138,8 +148,13 @@ final class GameInputView extends View {
             else if(c.kind==RIGHT_STICK&&!right){rx=stick(x,length);ry=stick(y,length);right=true;}
         }sink.pad(buttons,lx,ly,rx,ry);
     }
+    // The pad is no longer on a timer: the floating toggle is the switch, so a drawn pad
+    // means the player asked for it and it stays until they ask it away. That also means
+    // nothing here needs to wake the view up on its own -- a padded screen with no touch
+    // is genuinely static now, which is one less invalidation per frame on a device that
+    // is being asked to hold 60 fps.
     @Override protected void onDraw(Canvas canvas){
-        super.onDraw(canvas);if(controllerConnected)return;
+        super.onDraw(canvas);if(!controlsVisible())return;
         canvas.save();canvas.translate(originX,originY);canvas.scale(scale,scale);
         paint.setTextAlign(Paint.Align.CENTER);
         for(Control c:controls){
@@ -148,7 +163,8 @@ final class GameInputView extends View {
                 cx=Math.max(c.r,Math.min((getWidth()-insetLeft-insetRight)/scale-c.r,p.originX));
                 cy=Math.max(c.r,Math.min((getHeight()-insetTop-insetBottom)/scale-c.r,p.originY));break;
             }}
-            boolean down=occupied(c);paint.setStyle(Paint.Style.FILL);paint.setColor(down?0x887BA9C5:0x48202B35);canvas.drawCircle(cx,cy,c.r,paint);
+            boolean down=occupied(c);
+            paint.setStyle(Paint.Style.FILL);paint.setColor(down?0x887BA9C5:0x48202B35);canvas.drawCircle(cx,cy,c.r,paint);
             paint.setStyle(Paint.Style.STROKE);paint.setStrokeWidth(1.5f);paint.setColor(down?0xDDEFFFFF:0x88FFFFFF);canvas.drawCircle(cx,cy,c.r,paint);
             paint.setStyle(Paint.Style.FILL);paint.setTextSize(c.r<23?14:20);paint.setColor(0xDDEFFFFF);
             if(c.kind==DPAD){canvas.drawText("◀",c.x-31,c.y+6,paint);canvas.drawText("▶",c.x+31,c.y+6,paint);canvas.drawText("▲",c.x,c.y-22,paint);canvas.drawText("▼",c.x,c.y+36,paint);}

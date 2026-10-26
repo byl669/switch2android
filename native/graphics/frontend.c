@@ -12,10 +12,12 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <time.h>
+#include <sys/mman.h>
 #define LOG ot2_host_log
 #define die ot2_host_die
 #define OLOG ot2_host_log
 #define B(x) ((x)&0xff)
+#define OT2_POOL_HOST_BACKED 0x80000000u
 typedef struct {const char* name;void* fn;} NativeImplementation;
 #ifdef __APPLE__
 #define NVN_SECTION "__DATA,ot2_nvn"
@@ -81,10 +83,20 @@ NVN(nvnDeviceGetInteger, void, const NVNdevice *d, NVNdeviceInfo what, int *out)
     unsigned w = (unsigned)what;
     if (w >= sizeof g_devinfo / sizeof *g_devinfo) { LOG("【红】nvnDeviceGetInteger 未知项 %#x，给 0", w); *out = 0; return; }
     *out = vkhost_device_limit(what,g_devinfo[w]);
-    OLOG("DeviceGetInteger %#x -> %d", w, *out);
+    // No per-call log. A title polls device properties for capabilities it checks
+    // every frame, and this call ran tens of thousands of times in a single run;
+    // logging each one wrote megabytes and, with synchronous file writes, held the
+    // frame loop back. Unknown properties are still reported above, which is the
+    // only case that needs attention.
 }
 NVN(nvnDeviceGetImageHandle, NVNimageHandle, const NVNdevice *d, int id) { (void)d; return (NVNimageHandle)id; }
 NVN(nvnDeviceGetTextureHandle,NVNtextureHandle,const NVNdevice* d,int texture,int sampler) {(void)d;return (uint64_t)texture|((uint64_t)sampler<<20);}
+// The texel-fetch handle addresses a texture without a sampler, so it carries the texture index
+// alone - the same encoding as nvnDeviceGetTextureHandle with the sampler field left zero, and the
+// same shape as nvnDeviceGetImageHandle below. The title stores the value in a constant buffer and
+// its shaders resolve it through the texture pool, which is how the engine's cbuf texture path
+// (XBG_SOURCE_TEXTURE_CBUF) reads it back.
+NVN(nvnDeviceGetTexelFetchHandle,NVNtextureHandle,const NVNdevice* d,int texture) {(void)d;return (uint64_t)texture;}
 // 分离贴图 / 采样器句柄：值 = 描述符号（采样器号放 20 位以上，与组合句柄的位布局一致）
 // Separate texture / sampler handles: value = descriptor index (the sampler index goes in bit 20 and above, consistent with the bit layout of combined handles)
 NVN(nvnDeviceGetSeparateTextureHandle, NVNseparateTextureHandle, const NVNdevice *d, int id) { (void)d; return (NVNseparateTextureHandle){(uint64_t)id}; }
@@ -118,13 +130,87 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
     return 1;
 }
-NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { if (((pool_t *)p)->mem) {  nvn_commands_pool_release(((pool_t *)p)->mem,((pool_t *)p)->size); vkhost_pool_del(((pool_t *)p)->mem); } ((pool_t *)p)->magic = 0; }
+NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
+    pool_t *o = (pool_t *)p;
+    if (o->mem) {
+        nvn_commands_pool_release(o->mem, o->size);
+        vkhost_pool_del(o->mem);
+        // A virtual pool was backed by a mapping this host owns; guest-supplied
+        // storage belongs to the title and must not be unmapped here.
+        if (o->flags & OT2_POOL_HOST_BACKED) munmap(o->mem, o->size);
+    }
+    o->magic = 0;
+}
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)((const pool_t *)p)->mem; }
 NVN(nvnMemoryPoolGetFlags,NVNmemoryPoolFlags,const NVNmemoryPool* p) {return ((const pool_t*)p)->flags;}
+// Sparse pools are mapped in one step on NVN. A virtual pool starts with no
+// storage, and until this call backs it every buffer and texture carved out of
+// it reports address 0 — which the title then uses as a shader code pointer.
+// Allocate real pages here so those addresses mean something.
+NVN_NOPROTO(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p) {
+    pool_t *o = (pool_t *)p;
+    if (o->mem) return 1;
+    if (!o->size) return 1;
+    void *mem = mmap(NULL, o->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        LOG("【红】MemoryPoolMapVirtual 分配失败 size=%#llx", (unsigned long long)o->size);
+        return 0;
+    }
+    o->mem = mem;
+    o->flags |= OT2_POOL_HOST_BACKED;
+    vkhost_pool_add(o->mem, o->size);
+    LOG("MemoryPoolMapVirtual %p -> %p size=%#llx", (void *)p, mem, (unsigned long long)o->size);
+    return 1;
+}
 NVN(nvnMemoryPoolGetSize,size_t,const NVNmemoryPool* p) {return ((const pool_t*)p)->size;}
 NVN(nvnMemoryPoolMap,void*,const NVNmemoryPool* p) {return ((const pool_t*)p)->mem;}
 NVN(nvnMemoryPoolInvalidateMappedRange,void,const NVNmemoryPool* p,ptrdiff_t offset,size_t size) {(void)p;(void)offset;(void)size;}
+
+// ---------- 缓冲 ----------
+// ---------- Buffers ----------
+// A buffer is a window into a memory pool. The guest never sees a host handle:
+// nvnBufferMap and nvnBufferGetAddress must return the address inside the pool
+// that the title already allocated, or the caller dereferences a null pointer.
+typedef struct { const pool_t *pool; int64_t off; uint64_t size; NVNdevice *dev; } buf_builder_t;
+typedef struct { uint32_t magic; const pool_t *pool; int64_t off; uint64_t size; } buf_t;
+_Static_assert(sizeof(buf_builder_t) <= sizeof(NVNbufferBuilder), "buffer builder must fit");
+_Static_assert(sizeof(buf_t) <= sizeof(NVNbuffer), "buffer must fit");
+#define BB(b) ((buf_builder_t *)(b))
+#define BU(o) ((buf_t *)(o))
+static void *buf_data(const buf_t *o) {
+    return (o && o->pool && o->pool->mem) ? o->pool->mem + o->off : NULL;
+}
+NVN_NOPROTO(nvnBufferBuilderSetDefaults, void, NVNbufferBuilder *b) {
+    memset(b, 0, sizeof(buf_builder_t));
+}
+NVN_NOPROTO(nvnBufferBuilderSetDevice, void, NVNbufferBuilder *b, NVNdevice *d) { BB(b)->dev = d; }
+NVN_NOPROTO(nvnBufferBuilderSetStorage, void, NVNbufferBuilder *b, NVNmemoryPool *p, ptrdiff_t off, size_t size) {
+    BB(b)->pool = (const pool_t *)p; BB(b)->off = off; BB(b)->size = size;
+}
+NVN_NOPROTO(nvnBufferInitialize, NVNboolean, NVNbuffer *o, const NVNbufferBuilder *b) {
+    const buf_builder_t *s = BB(b); buf_t *d = BU(o);
+    memset(o, 0, sizeof(buf_t));
+    d->magic = MAGIC('B', 'U', 'F', 0); d->pool = s->pool; d->off = s->off; d->size = s->size;
+    if (!d->pool || !d->pool->mem) {
+        // Without backing storage every later Map returns null; say so once
+        // instead of letting the title fault somewhere unrelated.
+        LOG("【红】BufferInitialize 没有后备存储 pool=%p off=%lld size=%llu",
+            (void *)d->pool, (long long)d->off, (unsigned long long)d->size);
+        return 0;
+    }
+    return 1;
+}
+NVN_NOPROTO(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *o) {
+    return (NVNbufferAddress)buf_data(BU(o));
+}
+NVN_NOPROTO(nvnBufferMap, void *, const NVNbuffer *o) { return buf_data(BU(o)); }
+NVN_NOPROTO(nvnBufferFlushMappedRange, void, const NVNbuffer *o, ptrdiff_t off, size_t n) { (void)o; (void)off; (void)n; }
+NVN_NOPROTO(nvnBufferInvalidateMappedRange, void, const NVNbuffer *o, ptrdiff_t off, size_t n) { (void)o; (void)off; (void)n; }
+NVN_NOPROTO(nvnBufferGetSize, size_t, const NVNbuffer *o) { return BU(o)->size; }
+NVN_NOPROTO(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *o) { return BU(o)->off; }
+NVN_NOPROTO(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *o) { return (NVNmemoryPool *)BU(o)->pool; }
+NVN_NOPROTO(nvnBufferFinalize, void, NVNbuffer *o) { BU(o)->magic = 0; }
 
 // ---------- 描述符池 ----------
 // ---------- Descriptor pools ----------
@@ -187,6 +273,15 @@ NVN(nvnTextureBuilderGetStorageSize, size_t, const NVNtextureBuilder *b) {
 NVN(nvnTextureBuilderGetStorageAlignment, size_t, const NVNtextureBuilder *b) {
     nvn_texlayout L; nvn_tex_layout(&((const tex_builder_t *)b)->d, &L); return L.align;
 }
+// NVN_STORAGE_CLASS_TEXTURE. Every builder this host accepts ends up in a memory
+// pool and sparse tiling is not implemented, so the answer is never NONE and
+// never SPARSE. A caller that gets NONE concludes the builder is unconfigured.
+NVN(nvnTextureBuilderGetStorageClass, NVNstorageClass, const NVNtextureBuilder *b) {
+    (void)b; return 2 /* NVN_STORAGE_CLASS_TEXTURE */;
+}
+NVN(nvnTextureGetStorageClass, NVNstorageClass, const NVNtexture *t) {
+    (void)t; return 2 /* NVN_STORAGE_CLASS_TEXTURE */;
+}
 #define TX(t) ((tex_t *)(t))
 #define CTX(t) ((const tex_t *)(t))
 NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b) {
@@ -203,14 +298,21 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
 }
 NVN(nvnTextureFinalize, void, NVNtexture *t) { vkhost_tex_release(TX(t)); TX(t)->magic = 0; }
 NVN(nvnTextureGetFlags, NVNtextureFlags, const NVNtexture *t) { return (NVNtextureFlags)CTX(t)->d.flags; }
-NVN(nvnTextureGetWidth, int, const NVNtexture *t) { return (int)CTX(t)->d.width; }
-NVN(nvnTextureGetHeight, int, const NVNtexture *t) { return (int)CTX(t)->d.height; }
+// GetWidth is defined below, together with the other atlas geometry probes.
+// A 4096x6144 glyph atlas holds about 96 rows of ~128 glyphs, and this title stops filling
+// one after roughly two rows and then starts overwriting: the characters it needs later come
+// back empty. That means its idea of how much room the atlas has is wrong, and the only three
+// answers it can be deriving that from are height, stride and storage size. Log what it asks
+// for and what it gets, once per kind, and the arithmetic that goes wrong becomes visible.
+#define ATLAS_PROBE(fn,val) do{const tex_t*c=CTX(t);if(c->d.height>=4096){static unsigned n=0;if(n++<40)LOG("【图集查询】%s serial=%llu w=%d h=%d fmt=%#x stride=%lld size=%lld levels=%d -> %lld",fn,(unsigned long long)c->serial,c->d.width,c->d.height,c->d.format,(long long)c->d.stride,(long long)c->L.size,c->d.levels,(long long)(val));}}while(0)
+NVN(nvnTextureGetWidth, int, const NVNtexture *t) { ATLAS_PROBE("GetWidth",(int)CTX(t)->d.width); return (int)CTX(t)->d.width; }
+NVN(nvnTextureGetHeight, int, const NVNtexture *t) { ATLAS_PROBE("GetHeight",(int)CTX(t)->d.height); return (int)CTX(t)->d.height; }
 NVN(nvnTextureGetDepth, int, const NVNtexture *t) { return (int)CTX(t)->d.depth; }
 NVN(nvnTextureGetLevels,int,const NVNtexture* t) {return CTX(t)->d.levels;}
 NVN(nvnTextureGetTarget,NVNtextureTarget,const NVNtexture* t) {return CTX(t)->d.target;}
 NVN(nvnTextureGetFormat,NVNformat,const NVNtexture* t) {return CTX(t)->d.format;}
 NVN(nvnTextureGetSamples,int,const NVNtexture* t) {return CTX(t)->d.samples;}
-NVN(nvnTextureGetStride,ptrdiff_t,const NVNtexture* t) {return CTX(t)->d.stride;}
+NVN(nvnTextureGetStride,ptrdiff_t,const NVNtexture* t) { ATLAS_PROBE("GetStride",CTX(t)->d.stride); return CTX(t)->d.stride; }
 // The reconstructed header incorrectly declares this opaque object by value.
 NVN_NOPROTO(nvnTextureGetMemoryPool,NVNmemoryPool*,const NVNtexture* t) {return (NVNmemoryPool*)CTX(t)->pool;}
 NVN(nvnTextureGetMemoryOffset,ptrdiff_t,const NVNtexture* t) {return CTX(t)->off;}
@@ -219,7 +321,7 @@ NVN(nvnTextureGetDepthStencilMode,NVNtextureDepthStencilMode,const NVNtexture* t
 NVN(nvnTextureGetSwizzle,void,const NVNtexture* t,NVNtextureSwizzle* r,NVNtextureSwizzle* g,NVNtextureSwizzle* b,NVNtextureSwizzle* a) {
     *r=CTX(t)->d.swizzle[0];*g=CTX(t)->d.swizzle[1];*b=CTX(t)->d.swizzle[2];*a=CTX(t)->d.swizzle[3];
 }
-NVN(nvnTextureGetStorageSize, int, const NVNtexture *t) { return (int)CTX(t)->L.size; }
+NVN(nvnTextureGetStorageSize, int, const NVNtexture *t) { ATLAS_PROBE("GetStorageSize",(int)CTX(t)->L.size); return (int)CTX(t)->L.size; }
 // Hierarchical depth metadata is allocated internally by the Vulkan driver.
 NVN(nvnTextureGetZCullStorageSize,size_t,const NVNtexture* t) {(void)t;return 0;}
 NVN(nvnTextureBuilderGetZCullStorageSize,size_t,const NVNtextureBuilder* b) {(void)b;return 0;}
@@ -279,6 +381,10 @@ NVN(nvnTextureWriteTexelsStrided,void,const NVNtexture* t,const NVNtextureView* 
     vkhost_write_texels(CTX(t),(const view_t*)v,r,source,row,image);
 }
 NVN(nvnTextureInvalidateTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }
+// Texel writes and reads go straight to the texture's backing memory on this
+// host: there is no separate cached copy to flush back or pull from, so both
+// directions are already coherent and the calls are no-ops.
+NVN(nvnTextureFlushTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }
 
 // ---------- 采样器 ----------
 // ---------- Samplers ----------
@@ -298,6 +404,10 @@ NVN(nvnSamplerBuilderSetLodBias, void, NVNsamplerBuilder *b, float v) { SB(b)->l
 NVN(nvnSamplerBuilderSetCompare, void, NVNsamplerBuilder *b, NVNcompareMode m, NVNcompareFunc f) { SB(b)->cmp_mode = m; SB(b)->cmp_func = f; }
 NVN(nvnSamplerBuilderSetBorderColor, void, NVNsamplerBuilder *b, const float *c) { memcpy(SB(b)->border, c, 16); }
 NVN(nvnSamplerBuilderSetMaxAnisotropy, void, NVNsamplerBuilder *b, float v) { SB(b)->aniso = v; }
+// Reduction filter applies to depth comparison samplers; the host samples at
+// full rate, which is the NVN default and what a caller asking for WEIGHTED_AVERAGE
+// still accepts.
+NVN(nvnSamplerBuilderSetReductionFilter, void, NVNsamplerBuilder *b, NVNsamplerReduction r) { (void)b; (void)r; }
 NVN(nvnSamplerBuilderSetLodSnap, void, NVNsamplerBuilder *b, float v) { (void)b; (void)v; }   // Metal 无对应，忽略 | No Metal equivalent, ignored
 NVN(nvnSamplerBuilderGetMinMagFilter, void, const NVNsamplerBuilder *b, NVNminFilter *mi, NVNmagFilter *ma) {
     const samp_par *o = &((const samp_builder_t *)b)->p; *mi = (NVNminFilter)o->minf; *ma = (NVNmagFilter)o->magf;
@@ -326,9 +436,23 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
 
     return 1;
 }
+// The extended form's stages are 0x18 bytes each (the pair above plus one
+// 8-byte extension word). Forwarding the caller's array as NVNshaderData read
+// every stage after the first at the wrong offset, which made fragment shaders
+// arrive with a control section that could never validate. Convert stage by
+// stage; the extension word itself is not modelled.
+NVN_NOPROTO(nvnProgramSetShadersExt, NVNboolean, NVNprogram *p, int n, const NVNshaderDataExt *sd) {
+    if (n < 0 || n > 6) { LOG("【红】ProgramSetShadersExt 阶段数 %d", n); return 0; }
+    NVNshaderData plain[6];
+    for (int i = 0; i < n; i++) {
+        plain[i].data = sd[i].data;
+        plain[i].control = sd[i].control;
+        static bool warned;
+        if (sd[i].extension && !warned) { warned = true; LOG("ProgramSetShadersExt 扩展字段非零 %#llx（host 不使用）", (unsigned long long)sd[i].extension); }
+    }
+    return h_nvnProgramSetShaders(p, n, plain);
+}
 
-// ---------- 同步 / 事件 ----------
-// ---------- Sync / events ----------
 NVN(nvnSyncInitialize, NVNboolean, NVNsync *s, NVNdevice *d) { (void)d; *(sync_t *)s = (sync_t){MAGIC('S', 'Y', 'N', 'C'), 0, 0}; return 1; }
 NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
 // 围栏 = 「此前提交到队列的命令全部完成」：记下最近一次提交的栅栏值
@@ -410,8 +534,25 @@ static void cmd_new_segment(cmd_t *o,uint8_t *mem,size_t n) {
 NVN(nvnCommandBufferAddCommandMemory,void,NVNcommandBuffer* c,const NVNmemoryPool* p,ptrdiff_t off,size_t n) {
     const pool_t* pl=(const pool_t*)p;
     if(!pl || !pl->mem || off<0 || n<64 || (uint64_t)off+n>pl->size)die("Invalid command memory grant");
+    // How much the title actually hands over decides whether a frame costs one
+    // grant or a thousand; keep the number visible without flooding the log.
+    static long grants,total;
+    static long extends_count;
+    ++grants;total+=(long)n;
     nvn_commands_grant(CB(c),pl->mem+off,n);
-    cmd_new_segment(CB(c),pl->mem+off,n);
+    // A title that tops up its command memory polls nvnCommandBufferGetCommandMemoryFree
+    // and adds until there is room. Restarting at the new segment on every add throws
+    // away the partially filled segment, so free space never grows, the title adds
+    // forever -- measured at ~10k guest re-entries per frame, which starves the frame
+    // loop -- and the tail of every recording is silently dropped, leaving the submitted
+    // command stream shorter than the title believes. When the new range continues
+    // exactly where the current segment ends, extend that segment instead.
+    cmd_t* o=CB(c);
+    uint8_t* before=o->end;
+    if(before && pl->mem+off==before) {o->end=before+n; ++extends_count;}
+    else cmd_new_segment(o,pl->mem+off,n);
+    if(grants<=24||grants%512==0)
+        LOG("[nvn] AddCommandMemory cb=%p magic=%x rec=%u cur=%p before=%p mem=%p extends=%ld grants=%ld",(void*)c,o->magic,o->recording,(void*)o->cur,(void*)before,(void*)(pl->mem+off),extends_count,grants);
 }
 NVN(nvnCommandBufferAddControlMemory,void,NVNcommandBuffer* c,void* memory,size_t n) {(void)memory;CB(c)->control_size=n;}
 NVN(nvnCommandBufferGetCommandMemorySize,size_t,const NVNcommandBuffer* c) {const cmd_t* o=(const cmd_t*)c;return o->end-o->memory_begin;}
@@ -420,11 +561,30 @@ NVN(nvnCommandBufferGetCommandMemoryFree,size_t,const NVNcommandBuffer* c) {cons
 NVN(nvnCommandBufferGetControlMemorySize,size_t,const NVNcommandBuffer* c) {return ((const cmd_t*)c)->control_size;}
 NVN(nvnCommandBufferGetControlMemoryUsed,size_t,const NVNcommandBuffer* c) {(void)c;return 0;}
 NVN(nvnCommandBufferGetControlMemoryFree,size_t,const NVNcommandBuffer* c) {return ((const cmd_t*)c)->control_size;}
+// A title's memory callback is told the *minimum* size it must add, so asking
+// for exactly one more command makes a title hand back a segment that holds one
+// command: the next allocation asks again, and a frame that records a few
+// hundred commands becomes a few hundred grants -- each one a re-entry into
+// guest code, a segment in the pin map, and a slice of the title's own command
+// pool. Ask for a working chunk instead; the second attempt falls back to the
+// exact size, so a title that really only has room for one command behaves
+// exactly as before.
+#define CMD_MIN_GRANT (64u*1024u)
 static uint8_t* cmd_alloc(cmd_t* o,uint32_t size) {
     size=(size+7)&~7u;
     for(int tries=0;!o->cur || o->cur+size+OP_RESERVE>o->end;tries++) {
+        // Asking the title for more command memory re-enters guest code while a
+        // host NVN entry is on the stack. Say so: a hang here looks exactly like
+        // a hang in whatever the title was recording. Rate-limited: a title that
+        // starves once per command would otherwise bury every other log line.
+        static long starved;
+        ++starved;
+        if(starved<=8||starved%256==0)
+            LOG("[nvn] cmd_alloc needs memory total=%ld size=%u tries=%d cur=%p end=%p cb=%p",starved,size,tries,(void*)o->cur,(void*)o->end,(void*)o->cb);
         if(!o->cb || tries==2)die("Command memory exhausted");
-        const uint64_t args[]={(uint64_t)o,NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY,size+OP_RESERVE,(uint64_t)o->cb_data,0,0,0,0};
+        const uint64_t wanted=size+OP_RESERVE;
+        const uint64_t request=(tries||wanted>=CMD_MIN_GRANT)?wanted:CMD_MIN_GRANT;
+        const uint64_t args[]={(uint64_t)o,NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY,request,(uint64_t)o->cb_data,0,0,0,0};
         ot2_call_guest_address((uint64_t)o->cb,args);
     }
     uint8_t* p=o->cur;o->cur+=size;put_hdr(p,0,size);return p;
@@ -439,6 +599,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_END, 8);
     o->recording = 0;
+    { static unsigned n; if(n++<8) LOG("[nvn] EndRecording #%u bytes=%llu", n, (unsigned long long)(o->cur-o->memory_begin)); }
     return (NVNcommandHandle)o->begin;
 }
 NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
@@ -496,6 +657,11 @@ static void *rec(NVNcommandBuffer *c, uint32_t op, size_t payload) {
     memset(p + 8, 0, sz - 8);
     return p + 8;
 }
+// The d2r replay layer appends a finished record it already holds (see
+// native/d2r/d2r_host.c); it needs the same reservation the recorder uses,
+// including the growth callback into the game's own command memory.
+uint8_t* nvn_command_alloc(cmd_t* o,uint32_t size) {return cmd_alloc(o,size);}
+
 #define REC(c, OP, T) ((T *)rec((c), (OP), sizeof(T)))
 // 带数组的绑定记录按实际个数分配：前缀字段 + n 个元素（回放端只读前 n 个）。原先按最大个数定长记（绑顶点缓冲 272 字节、绑贴图 / 采样器 280 字节，
 // 实际常只有 1–2 个），空尾占每帧命令字节的四到五成；88 级法师的高级属性页每帧录 12.5 MB，把游戏自己的命令内存池（约每帧 105 段 × 128 KB）用空
@@ -526,7 +692,54 @@ NVN(nvnCommandBufferSetViewports, void, NVNcommandBuffer *c, int first, int n, c
 NVN(nvnCommandBufferSetViewport,void,NVNcommandBuffer* c,int x,int y,int width,int height) {
     p_viewports* v=REC(c,OP_VIEWPORTS,p_viewports);v->first=0;v->n=1;v->v[0][0]=x;v->v[0][1]=y;v->v[0][2]=width;v->v[0][3]=height;v->v[0][5]=1;
 }
+// Debug labels name objects for a host-side debugger. They carry no rendering
+// state and nothing in the pipeline reads them, so implementing them as no-ops is
+// the whole of their behaviour here.
+//
+// They are worth defining even so: a title that labels every buffer and sampler it
+// creates calls these tens of thousands of times, and while unimplemented each call
+// went through the generic missing-API path and wrote a log line. That log grew to
+// megabytes and, with the file written synchronously, took enough time per frame to
+// hold the frame loop back.
+NVN_NOPROTO(nvnBufferSetDebugLabel, void, NVNbuffer *b, const char *label) { (void)b; (void)label; }
+NVN_NOPROTO(nvnSamplerSetDebugLabel, void, NVNsampler *s, const char *label) { (void)s; (void)label; }
+NVN_NOPROTO(nvnMemoryPoolSetDebugLabel, void, NVNmemoryPool *p, const char *label) { (void)p; (void)label; }
 NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) { *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
+// The plural form sets a range of scissor rectangles. Every graphics pipeline in
+// this backend carries a single dynamic scissor (see command_state.inc), so a
+// range wider than one rectangle cannot be expressed exactly: Vulkan would need a
+// scissor array and the same count in the pipeline state.
+//
+// Rather than dropping the call, the union of the requested rectangles is used.
+// That errs towards drawing too much instead of clipping content away, which
+// keeps the picture complete and only costs overdraw in the regions a title meant
+// to cut. The first call that asks for more than one rectangle is reported so the
+// real distribution is known instead of assumed.
+NVN_NOPROTO(nvnCommandBufferSetScissors, void, NVNcommandBuffer *c, int first, int num, const NVNrectangle *rects) {
+    if (!rects || num <= 0) return;
+    static unsigned multi;
+    if (num > 1 && !__atomic_fetch_add(&multi, 1u, __ATOMIC_RELAXED))
+        LOG("SetScissors: %d rectangles from index %d; using their union (single-scissor backend)", num, first);
+    int x0 = rects[0].x, y0 = rects[0].y;
+    int x1 = rects[0].x + rects[0].width, y1 = rects[0].y + rects[0].height;
+    for (int i = 1; i < num; i++) {
+        if (rects[i].x < x0) x0 = rects[i].x;
+        if (rects[i].y < y0) y0 = rects[i].y;
+        if (rects[i].x + rects[i].width > x1) x1 = rects[i].x + rects[i].width;
+        if (rects[i].y + rects[i].height > y1) y1 = rects[i].y + rects[i].height;
+    }
+    *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x0, y0, x1 - x0, y1 - y0};
+}
+// The plural depth-range form: ranges holds num pairs of (near, far). Vulkan has
+// one depth range for the whole pipeline, so the first pair is the one a
+// single-viewport render pass can honour; a wider range is reported once.
+NVN_NOPROTO(nvnCommandBufferSetDepthRanges, void, NVNcommandBuffer *c, int first, int num, const float *ranges) {
+    if (!ranges || num <= 0) return;
+    static unsigned multi;
+    if (num > 1 && !__atomic_fetch_add(&multi, 1u, __ATOMIC_RELAXED))
+        LOG("SetDepthRanges: %d ranges from index %d; using the first (one depth range per pipeline)", num, first);
+    *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){ranges[0], ranges[1]};
+}
 NVN(nvnCommandBufferSetDepthBounds,void,NVNcommandBuffer* c,uint32_t enable,float minimum,float maximum) { *REC(c,OP_DEPTH_BOUNDS,p_depth_bounds)=(p_depth_bounds){B(enable),minimum,maximum}; }
 NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) { *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
 NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p, int stages) {
@@ -670,6 +883,15 @@ NVN(nvnCommandBufferSetSampleMask,void,NVNcommandBuffer* c,int mask){*(uint32_t*
 NVN(nvnCommandBufferSetRasterizerDiscard,void,NVNcommandBuffer* c,uint32_t enable){*(uint32_t*)rec(c,OP_RASTER_DISCARD,8)=B(enable)!=0;}
 NVN(nvnCommandBufferSetDepthClamp,void,NVNcommandBuffer* c,uint32_t enable){*(uint32_t*)rec(c,OP_DEPTH_CLAMP,8)=B(enable)!=0;}
 NVN(nvnCommandBufferSetRenderEnable,void,NVNcommandBuffer* c,uint32_t enable){*(uint32_t*)rec(c,OP_RENDER_ENABLE,8)=B(enable)!=0;}
+// Conditional render, used for occlusion culling: the title reports samples passed
+// twice and asks the GPU whether anything got through in between. The comparison
+// happens where the counters are read (see OP_RENDER_COND in backend.cpp), not
+// here, because the second sample may not have been written yet when the command
+// is recorded.
+NVN_NOPROTO(nvnCommandBufferSetRenderEnableConditional, void, NVNcommandBuffer *c, int mode, NVNbufferAddress address) {
+    if (mode != 0 && mode != 1) { LOG("SetRenderEnableConditional: unknown mode %d, drawing anyway", mode); return; }
+    *REC(c, OP_RENDER_COND, p_render_cond) = (p_render_cond){mode, 0, address};
+}
 NVN(nvnCommandBufferSetLineWidth,void,NVNcommandBuffer* c,float width){*(float*)rec(c,OP_LINE_WIDTH,8)=width;}
 NVN(nvnCommandBufferDownsampleTextureView,void,NVNcommandBuffer* c,const NVNtexture* source,const NVNtextureView* sv,const NVNtexture* destination,const NVNtextureView* dv){
     const tex_t* s=CTX(source);const tex_t* d=CTX(destination);const view_t* a=(const view_t*)sv;const view_t* b=(const view_t*)dv;
@@ -769,7 +991,17 @@ NVN(nvnQueueSubmitCommands,void,NVNqueue* q,int n,const NVNcommandHandle* handle
 NVN(nvnWindowAcquireTexture,NVNwindowAcquireTextureResult,NVNwindow* w,NVNsync* s,int* index) {
     win_t* o=(win_t*)w;if(o->ntex<=0)die("Empty window texture set");
     *index=o->next;o->next=(o->next+1)%o->ntex;
-    vkhost_wait(o->ticket[*index],UINT64_MAX);
+    // Vsync throttling belongs here, not in present: a title usually calls
+    // present while holding one of its own locks, so blocking there can stall a
+    // worker that never gets scheduled. deko3d documents the same rule for
+    // dkQueueAcquireImage ("blocks if all images are in use"); the real device
+    // waits here until the image's previous present has been displayed.
+    // The wait is capped: present may never happen during bring-up, and an
+    // uncapped wait would turn a spin into a deadlock.
+    {
+        const uint64_t ticket=o->ticket[*index];
+        if(ticket)vkhost_wait(ticket,100000000ULL);
+    }
     if(s){__atomic_store_n(&((sync_t*)s)->fence,o->ticket[*index],__ATOMIC_RELEASE);__atomic_store_n(&((sync_t*)s)->fenced,1,__ATOMIC_RELEASE);}
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }

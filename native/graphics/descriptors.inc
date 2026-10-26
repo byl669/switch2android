@@ -177,13 +177,32 @@ DescriptorSlot* acquire_descriptors(const std::vector<VkDescriptorSetLayoutBindi
     if(!selected){
     auto bindings=input;
     std::sort(bindings.begin(),bindings.end(),[](const auto& a,const auto& b){return a.binding<b.binding;});
+    // The same binding can be reached twice: the support buffer is injected per
+    // group, and a group that is appended as well as prepared contributes its
+    // entries twice. One layout entry per binding is what Vulkan wants, and the
+    // duplicates always agree on type, so the first one stands. A duplicate that
+    // disagrees on type is a real conflict and still stops the run.
+    for(size_t i=1;i<bindings.size();){
+        if(bindings[i].binding!=bindings[i-1].binding){++i;continue;}
+        if(bindings[i].descriptorType!=bindings[i-1].descriptorType||bindings[i].descriptorCount!=bindings[i-1].descriptorCount)
+            ot2_host_die("Descriptor binding %u used as two types",bindings[i].binding);
+        bindings.erase(bindings.begin()+long(i));
+    }
     PipelineKey key;key.bindings(bindings);
     auto [it,inserted]=descriptor_layouts.try_emplace(key.data);
     auto& entry=it->second;
     if(inserted){
         for(size_t i=0;i<bindings.size();i++){
-            if(bindings[i].pImmutableSamplers || (i&&bindings[i-1].binding==bindings[i].binding))
-                ot2_host_die("Invalid cached descriptor layout");
+            if(bindings[i].pImmutableSamplers || (i&&bindings[i-1].binding==bindings[i].binding)){
+                // Naming the offender is the difference between a five-minute fix
+                // and another run: the same binding twice and an immutable sampler
+                // are two different mistakes.
+                char list[256]={0};size_t used=0;
+                for(size_t k=0;k<bindings.size()&&used<sizeof list-24;k++)
+                    used+=size_t(snprintf(list+used,sizeof list-used," %u:t%u%s",bindings[k].binding,
+                        unsigned(bindings[k].descriptorType),bindings[k].pImmutableSamplers?"(imm)":""));
+                ot2_host_die("Invalid cached descriptor layout:%s",list);
+            }
         }
         VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         li.bindingCount=bindings.size();li.pBindings=bindings.data();

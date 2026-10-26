@@ -14,12 +14,17 @@
 #include <algorithm>
 #include <condition_variable>
 #include <array>
+#include <cstdlib>
 namespace ot2 {
 namespace {
 using R=uint64_t*;
 struct Buffer {void* data;uint64_t capacity,size;};
 struct Output {
     std::mutex mutex;AAudioStream* stream{};uint32_t event{};int channels{2},rate{48000};bool logged_pcm{};std::atomic<bool> started{false};std::atomic<uint64_t> played_frames{0};
+    // 0 = let AAudio pick. The audren sink sets a capacity in frames so a
+    // producer that paces itself on a 5 ms timer can absorb its own jitter
+    // instead of underrunning the stream.
+    int buffer_frames{};
     std::deque<Buffer*> pending,released;size_t position{};
     // All stream API calls are serialized here. The error callback only posts
     // recovery; closing a stream from its own callback can deadlock AAudio.
@@ -80,6 +85,7 @@ aaudio_result_t open_stream(Output& a){
     AAudioStreamBuilder_setDirection(b,AAUDIO_DIRECTION_OUTPUT);AAudioStreamBuilder_setFormat(b,AAUDIO_FORMAT_PCM_I16);
     AAudioStreamBuilder_setChannelCount(b,a.channels);AAudioStreamBuilder_setSampleRate(b,a.rate);
     AAudioStreamBuilder_setSharingMode(b,AAUDIO_SHARING_MODE_SHARED);AAudioStreamBuilder_setPerformanceMode(b,AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    if(a.buffer_frames>0)AAudioStreamBuilder_setBufferCapacityInFrames(b,a.buffer_frames);
     AAudioStreamBuilder_setDataCallback(b,render,&a);AAudioStreamBuilder_setErrorCallback(b,stream_error,&a);
     rc=AAudioStreamBuilder_openStream(b,&a.stream);AAudioStreamBuilder_delete(b);
     if(rc>=0){
@@ -167,6 +173,84 @@ bool probe_audio_recovery(){
     a.reset(); // Join all consumers before the stack-owned PCM goes away.
     return recovered&&paced;
 }
+// ---- AudioRenderer (audren) sink ----------------------------------------
+// The audren path hands out complete interleaved frames, so unlike AudioOut
+// there is nothing to describe back to the guest: the renderer owns the blocks
+// and the sink owns a heap copy. Blocks are recycled instead of freed, because
+// the renderer produces one per 5 ms frame and an allocation per frame would be
+// the only per-frame heap traffic in the audio path.
+//
+// `spare` is guarded by the Output's own `mutex`, not by audren_mutex: every
+// access touches `released` in the same breath, and one lock for both keeps the
+// order trivial.
+namespace {
+struct AudrenSink {std::shared_ptr<Output> out;std::deque<Buffer*> spare;};
+std::mutex audren_mutex;std::map<uint64_t,std::shared_ptr<AudrenSink>> audren_sinks;
+uint64_t audren_next_id=1;
+}
+uint64_t audren_sink_open(int rate,int channels){
+    if(rate<=0||channels<1||channels>8)return 0;
+    auto sink=std::make_shared<AudrenSink>();
+    auto a=std::make_shared<Output>();a->rate=rate;a->channels=channels;
+    // 100 ms of buffer: the producer is a 5 ms timer, and timer jitter that the
+    // stream cannot absorb shows up as dropouts rather than as a slow clock.
+    a->buffer_frames=rate/10;
+    a->active=audio_active.load();
+    auto rc=open_stream(*a);
+    if(rc<0){close_stream(*a);request_recovery(*a,rc);ot2_host_log("AUDIO_SINK_UNAVAILABLE error=%d; paced silent output until recovery",rc);}
+    a->recovery_thread=std::thread([state=a.get()]{recover_output(*state);});
+    a->silent_thread=std::thread([state=a.get()]{silent_output(*state);});
+    {std::lock_guard lock(a->control);a->started=true;}
+    a->silent_changed.notify_all();
+    if(a->active)transition(*a,true);
+    sink->out=a;
+    uint64_t id;
+    {std::lock_guard lock(audren_mutex);id=audren_next_id++;}
+    // Registered in `outputs` so set_audio_active drives it with everything else:
+    // a sink that keeps pulling while the app is in the background is exactly the
+    // case that path exists to prevent.
+    {std::lock_guard lock(outputs_mutex);outputs.emplace(id,a);}
+    {std::lock_guard lock(audren_mutex);audren_sinks.emplace(id,sink);}
+    ot2_host_log("AUDIO_SINK_OPEN id=%llu rate=%d channels=%d capacity=%d frames",
+                 (unsigned long long)id,rate,channels,a->buffer_frames);
+    return id;
+}
+void audren_sink_write(uint64_t sink,const int16_t* interleaved,int frames){
+    if(!sink||!interleaved||frames<=0)return;
+    std::shared_ptr<AudrenSink> s;
+    {std::lock_guard lock(audren_mutex);auto it=audren_sinks.find(sink);if(it==audren_sinks.end())return;s=it->second;}
+    Output& a=*s->out;
+    const size_t bytes=size_t(frames)*size_t(a.channels)*sizeof(int16_t);
+    std::lock_guard lock(a.mutex);
+    while(!a.released.empty()){s->spare.push_back(a.released.front());a.released.pop_front();}
+    Buffer* block=nullptr;
+    for(auto it=s->spare.begin();it!=s->spare.end();++it)
+        if((*it)->capacity>=bytes){block=*it;s->spare.erase(it);break;}
+    if(!block){
+        block=static_cast<Buffer*>(calloc(1,sizeof(Buffer)));
+        if(!block)return;
+        block->data=malloc(bytes);
+        if(!block->data){free(block);return;}
+        block->capacity=bytes;
+    }
+    block->size=bytes;
+    memcpy(block->data,interleaved,bytes);
+    a.pending.push_back(block);
+}
+void audren_sink_close(uint64_t sink){
+    std::shared_ptr<AudrenSink> s;
+    {std::lock_guard lock(audren_mutex);auto it=audren_sinks.find(sink);if(it==audren_sinks.end())return;s=it->second;audren_sinks.erase(it);}
+    {std::lock_guard lock(outputs_mutex);outputs.erase(sink);}
+    Output& a=*s->out;
+    {std::lock_guard lock(a.mutex);
+     for(Buffer* b:a.pending){free(b->data);free(b);}a.pending.clear();
+     for(Buffer* b:a.released){free(b->data);free(b);}a.released.clear();
+     for(Buffer* b:s->spare){free(b->data);free(b);}s->spare.clear();}
+    // Last reference: the destructor signals closing and joins the recovery and
+    // paced-silent threads before the stream is torn down.
+    s->out.reset();
+    ot2_host_log("AUDIO_SINK_CLOSE id=%llu",(unsigned long long)sink);
+}
 const std::vector<HostService>& audio_services(){static const std::vector<HostService> table={
     // Both original SDK classes implement the same IOpusDecoder vtable (10
     // slots, checked against this game's relocation table). Software uses
@@ -186,11 +270,12 @@ const std::vector<HostService>& audio_services(){static const std::vector<HostSe
     {"_ZN2nn5codec47GetHardwareOpusMultiStreamDecoderProcessingTimeEPKNS0_34HardwareOpusMultiStreamDecoderTypeE",[](R)->uint64_t{return 0;}},
     {"_ZN2nn5audio27InitializeAudioOutParameterEPNS0_17AudioOutParameterE",[](R r)->uint64_t{memset(reinterpret_cast<void*>(r[0]),0,8);return 0;}},
     {"_ZN2nn5audio13ListAudioOutsEPNS0_12AudioOutInfoEi",[](R r)->uint64_t{if(int32_t(r[1])<1)return 0;auto* info=reinterpret_cast<char*>(r[0]);memset(info,0,256);memcpy(info,"DeviceOut",10);return 1;}},
-    {"_ZN2nn5audio12OpenAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventEPKcRKNS0_17AudioOutParameterE",[](R r)->uint64_t{auto* name=reinterpret_cast<const char*>(r[2]);if(name&&*name&&strcmp(name,"DeviceOut"))ot2_host_die("Unknown AudioOut device");return open_output(r[0],r[1],r[3]);}},
-    {"_ZN2nn5audio12OpenAudioOutEPNS0_8AudioOutEPKcRKNS0_17AudioOutParameterE",[](R r)->uint64_t{auto* name=reinterpret_cast<const char*>(r[1]);if(name&&*name&&strcmp(name,"DeviceOut"))ot2_host_die("Unknown AudioOut device");return open_output(r[0],0,r[2]);}},
-    {"_ZN2nn5audio19OpenDefaultAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventERKNS0_17AudioOutParameterE",[](R r)->uint64_t{return open_output(r[0],r[1],r[2]);}},
+    {"_ZN2nn5audio12OpenAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventEPKcRKNS0_17AudioOutParameterE",[](R r)->uint64_t{auto* name=reinterpret_cast<const char*>(r[2]);if(name&&*name&&strcmp(name,"DeviceOut"))ot2_host_die("Unknown AudioOut device");auto res=open_output(r[0],r[1],r[3]);ot2_host_log("AUDIO_OPEN event=%#llx res=%#llx",(unsigned long long)r[1],(unsigned long long)res);return res;}},
+    {"_ZN2nn5audio12OpenAudioOutEPNS0_8AudioOutEPKcRKNS0_17AudioOutParameterE",[](R r)->uint64_t{auto* name=reinterpret_cast<const char*>(r[1]);if(name&&*name&&strcmp(name,"DeviceOut"))ot2_host_die("Unknown AudioOut device");auto res=open_output(r[0],0,r[2]);ot2_host_log("AUDIO_OPEN_DEFAULT res=%#llx",(unsigned long long)res);return res;}},
+    {"_ZN2nn5audio19OpenDefaultAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventERKNS0_17AudioOutParameterE",[](R r)->uint64_t{auto res=open_output(r[0],r[1],r[2]);ot2_host_log("AUDIO_OPEN_DEFAULT event=%#llx res=%#llx",(unsigned long long)r[1],(unsigned long long)res);return res;}},
     {"_ZN2nn5audio19OpenDefaultAudioOutEPNS0_8AudioOutERKNS0_17AudioOutParameterE",[](R r)->uint64_t{return open_output(r[0],0,r[1]);}},
     {"_ZN2nn5audio13StartAudioOutEPNS0_8AudioOutE",[](R r)->uint64_t{auto result=start_output(r[0],true);ot2_host_log("AUDIO_OUTPUT_STARTED");return result;}},
+    {"_ZN2nn5audio21AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE__TRACE",[](R)->uint64_t{return 0;}},
     {"_ZN2nn5audio12StopAudioOutEPNS0_8AudioOutE",[](R r)->uint64_t{return start_output(r[0],false);}},
     {"_ZN2nn5audio13CloseAudioOutEPNS0_8AudioOutE",[](R r)->uint64_t{std::shared_ptr<Output> removed;{std::lock_guard lock(outputs_mutex);auto it=outputs.find(r[0]);if(it!=outputs.end()){removed=it->second;outputs.erase(it);}}return 0;}},
     {"_ZN2nn5audio15GetAudioOutNameEPKNS0_8AudioOutE",[](R)->uint64_t{return reinterpret_cast<uint64_t>("DeviceOut");}},
@@ -203,7 +288,7 @@ const std::vector<HostService>& audio_services(){static const std::vector<HostSe
     {"_ZN2nn5audio28GetAudioOutBufferDataPointerEPKNS0_14AudioOutBufferE",[](R r)->uint64_t{return reinterpret_cast<uint64_t>(reinterpret_cast<Buffer*>(r[0])->data);}},
     {"_ZN2nn5audio25GetAudioOutBufferDataSizeEPKNS0_14AudioOutBufferE",[](R r)->uint64_t{return reinterpret_cast<Buffer*>(r[0])->size;}},
     {"_ZN2nn5audio27GetAudioOutBufferBufferSizeEPKNS0_14AudioOutBufferE",[](R r)->uint64_t{return reinterpret_cast<Buffer*>(r[0])->capacity;}},
-    {"_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE",[](R r)->uint64_t{auto a=output(r[0]);auto* b=reinterpret_cast<Buffer*>(r[1]);if(!b->data || !b->size || b->size>b->capacity || b->size%(2*a->channels))ot2_host_die("Invalid PCM output buffer");std::lock_guard lock(a->mutex);if(a->pending.size()+a->released.size()>=64)return 0;if(std::find(a->pending.begin(),a->pending.end(),b)!=a->pending.end()||std::find(a->released.begin(),a->released.end(),b)!=a->released.end())ot2_host_die("Audio buffer appended before release");a->pending.push_back(b);return 1;}},
+    {"_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE",[](R r)->uint64_t{static std::atomic<unsigned> n{0};if(n.fetch_add(1,std::memory_order_relaxed)<8)ot2_host_log("AUDIO_APPEND size=%llu",(unsigned long long)(r[1]?reinterpret_cast<Buffer*>(r[1])->size:0));auto a=output(r[0]);auto* b=reinterpret_cast<Buffer*>(r[1]);if(!b->data || !b->size || b->size>b->capacity || b->size%(2*a->channels))ot2_host_die("Invalid PCM output buffer");std::lock_guard lock(a->mutex);if(a->pending.size()+a->released.size()>=64)return 0;if(std::find(a->pending.begin(),a->pending.end(),b)!=a->pending.end()||std::find(a->released.begin(),a->released.end(),b)!=a->released.end())ot2_host_die("Audio buffer appended before release");a->pending.push_back(b);return 1;}},
     {"_ZN2nn5audio22GetAudioOutBufferCountEPKNS0_8AudioOutE",[](R r)->uint64_t{auto a=output(r[0]);std::lock_guard lock(a->mutex);return a->pending.size();}},
     {"_ZN2nn5audio22ContainsAudioOutBufferEPKNS0_8AudioOutEPKNS0_14AudioOutBufferE",[](R r)->uint64_t{auto a=output(r[0]);auto* b=reinterpret_cast<Buffer*>(r[1]);std::lock_guard lock(a->mutex);return std::find(a->pending.begin(),a->pending.end(),b)!=a->pending.end()||std::find(a->released.begin(),a->released.end(),b)!=a->released.end();}},
     {"_ZN2nn5audio20FlushAudioOutBuffersEPNS0_8AudioOutE",[](R r)->uint64_t{auto a=output(r[0]);bool released=false;{std::lock_guard lock(a->mutex);released=!a->pending.empty();while(!a->pending.empty()){a->released.push_back(a->pending.front());a->pending.pop_front();}a->position=0;}if(released&&a->event)ot2_signal_event(a->event);return 1;}},

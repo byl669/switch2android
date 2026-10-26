@@ -201,6 +201,25 @@ extern "C" JNIEXPORT jstring JNICALL Java_dev_ot2_port_MainActivity_runNativePro
     try {bool passed=save_transaction_probe(private_directory);out << ",\"save_atomic_publish\":" << (passed?"true":"false");}
     catch(const std::exception& e){out << ",\"save_probe_error\":" << quote(e.what());}
     std::string compatibility_error;
+    // A bring-up run is about the system service layer, not the display path.
+    // A software renderer (an emulator's llvmpipe, for instance) cannot satisfy
+    // the texture probes below and would abort before the guest ever runs, so
+    // the marker skips the graphics section entirely and lets the boot proceed.
+    std::error_code diagnostic_ec;
+    const bool diagnostic=!private_directory.empty()&&
+        std::filesystem::exists(std::filesystem::path(private_directory)/"diagnostic-svc",diagnostic_ec);
+    if(diagnostic) {
+        out << ",\"vulkan\":{\"skipped\":\"diagnostic\"},\"graphics_probes_skipped\":true";
+        __android_log_print(ANDROID_LOG_INFO,"OT2Probe","diagnostic mode: graphics probes skipped");
+        if(!directory.empty()&&inspect_modules) {
+            try { auto loaded=ot2::inspect_modules(directory); out << ",\"loader\":" << loaded; }
+            catch(const std::exception& e) { out << ",\"loader_error\":" << quote(e.what()); }
+        }
+        out << ",\"game_booted\":false}";
+        const auto skipped=out.str();
+        __android_log_print(ANDROID_LOG_INFO,"OT2Probe","%s",skipped.c_str());
+        return env->NewStringUTF(skipped.c_str());
+    }
     try { auto gpu=gpu_probe(compatibility_error); out << ",\"vulkan\":" << gpu; }
     catch(const std::exception& e) { compatibility_error="GPU 基础验证未通过。";out << ",\"vulkan_error\":" << quote(e.what()); }
     if(!compatibility_error.empty()){

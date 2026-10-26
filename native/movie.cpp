@@ -95,9 +95,30 @@ uint64_t poll_decoder(Decoder* state){
     }
     return 0;
 }
+// Wake every client event the title registered with RegisterClientEvents.
+//
+// These four events are the whole contract between the decoder and the title's
+// own player thread: it parks in WaitSynchronization on them and feeds or drains
+// the codec when one is signalled. The decoder is their only producer, and
+// Stop/Reset/Flush is exactly where it stops producing -- so without this wake a
+// player thread that happened to be parked at that moment is never released. It
+// then lives forever, and the teardown that destroys the player joins it with
+// nn::os::WaitThread, which never returns: the minigame result screen never
+// appears while the title keeps rendering and keeps taking input, which is how
+// the stall was reported ("time's up" stays on screen and nothing advances).
+// Signalling an event with no waiter is harmless, so this is safe on every path.
+void release_waiters(Decoder& d){
+    for(unsigned event=0;event<4;++event)signal(d,event);
+}
 void join_worker(Decoder& d){
+    // Release before the join, not after: the point is to let the title's player
+    // thread run its stop path, and only then can this thread's exit be observed.
+    release_waiters(d);
     d.quit.store(true,std::memory_order_release);
     if(d.worker_live){call("_ZN2nn2os10WaitThreadEPNS0_10ThreadTypeE",{ptr(d.worker.data())});call("_ZN2nn2os13DestroyThreadEPNS0_10ThreadTypeE",{ptr(d.worker.data())});d.worker_live=false;}
+    // Again afterwards, because a waiter woken by the first pass can re-arm
+    // between that pass and the thread actually leaving.
+    release_waiters(d);
 }
 uint32_t start_worker(Decoder& d){
     if(!d.stack)d.stack=reinterpret_cast<void*>(call("aligned_alloc",{4096,128*1024}));
@@ -110,8 +131,14 @@ uint32_t start_worker(Decoder& d){
 }
 void clear_buffers(Decoder& d){d.inputs.clear();d.outputs.clear();d.leased_inputs.clear();d.frames.clear();d.completed.clear();d.input_eos=false;}
 uint32_t stop(Decoder& d){
-    join_worker(d);std::lock_guard lock(d.mutex);uint32_t rc=Ok;
-    if(d.started){rc=error(d,AMediaCodec_stop(d.codec),"stop");d.started=false;d.configured=false;}
+    // Mark it stopped before anything is woken: a released waiter calls back into
+    // this file, and it has to observe BadState (its own stop path) instead of
+    // taking a buffer from a codec that is about to be stopped underneath it.
+    bool was_started;
+    {std::lock_guard lock(d.mutex);was_started=d.started;d.started=false;}
+    join_worker(d);
+    std::lock_guard lock(d.mutex);uint32_t rc=Ok;
+    if(was_started){rc=error(d,AMediaCodec_stop(d.codec),"stop");d.configured=false;}
     clear_buffers(d);return rc;
 }
 uint64_t construct(R r){

@@ -7,6 +7,8 @@ __pycache__/
 **/bin/
 **/obj/
 local.properties
+# 构建工作区（2.4 GB CMake/gradle 产物，绝不入库）
+s2a-work/
 *.keys
 *.nsp
 *.nca

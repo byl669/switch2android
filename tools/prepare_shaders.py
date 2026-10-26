@@ -65,17 +65,27 @@ def main():
     parser.add_argument('--captures', type=pathlib.Path)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    jobs, issues, conflicts, adapted_views = [], {}, [], []
+    jobs, issues, conflicts, adapted_views, without_assembly = [], {}, [], [], []
     compared = 0
     for control_path in sorted(args.shaders.glob('*.control')):
         key = control_path.stem
         control = control_path.read_bytes()
         code = control_path.with_suffix('.code').read_bytes()
         u = lambda off: struct.unpack_from('<I', control, off)[0]
-        assembly = control_path.with_suffix('.asm').read_text(errors='strict')
+        # The assembly text is optional. A shader captured at run time has only
+        # the control section and the machine code -- the console never
+        # serialises a disassembly for it -- and much of the shipped set is the
+        # same, so requiring the file discards shaders that translate perfectly
+        # well. Without it the texture and image slot types are unknown, and the
+        # translator reports the shaders that actually need them; those come back
+        # as failures instead of blocking the whole batch.
+        assembly_path = control_path.with_suffix('.asm')
+        assembly = assembly_path.read_text(errors='strict') if assembly_path.exists() else ''
         inferred, unresolved = facts(assembly)
         if unresolved:
             issues[key] = unresolved
+        if not assembly:
+            without_assembly.append(key)
         if args.captures and (observed := args.captures / f'{key}.facts.json').exists():
             runtime = json.loads(observed.read_text())
             for slot, expected in inferred['tex'].items():
@@ -96,11 +106,16 @@ def main():
                    code=str(cropped.resolve()), c1=code[u(0x700):u(0x704)].hex(),
                    debug=True, reduced=False, strict=True, **inferred, attr={}, fout={})
         if job['stage'] == 'cs':
-            job.update(compute_metadata(control, assembly))
+            # The cross-check reads SHARED_MEMORY / GROUP_SIZE out of the
+            # assembly. Passing None when there is none keeps the control
+            # section as the only authority instead of failing the shader.
+            job.update(compute_metadata(control, assembly or None))
         jobs.append(job)
     report = dict(shaders=len(jobs), compared_texture_slots=compared,
-                  runtime_conflicts=conflicts, adapted_texture_views=adapted_views, unresolved=issues)
-    (args.output / 'facts-report.json').write_text(json.dumps(report, indent=2))
+                  runtime_conflicts=conflicts, adapted_texture_views=adapted_views,
+                  no_assembly=len(without_assembly), unresolved=issues)
+    (args.output / 'facts-report.json').write_text(json.dumps(
+        dict(report, no_assembly_keys=without_assembly), indent=2))
     (args.output / 'jobs.json').write_text(json.dumps(jobs))
     print(json.dumps({k: v if k != 'unresolved' else len(v) for k, v in report.items()}, indent=2))
     if conflicts or issues:

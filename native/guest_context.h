@@ -13,5 +13,7 @@ GuestThread* ot2_guest_context_current();
 GuestThread* ot2_guest_context_create();
 void ot2_guest_context_use_stack(GuestThread*,uintptr_t base,size_t size);
 void ot2_guest_context_callback_stack(GuestThread*,uintptr_t& base,size_t& size);
+// Page-guarded stack for a worker entry, independent of the callback stack.
+void ot2_guest_context_worker_stack(GuestThread*,uintptr_t& base,size_t& size);
 size_t ot2_guest_context_live();
 size_t ot2_guest_context_bytes();

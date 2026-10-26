@@ -175,6 +175,23 @@ void record_shader_facts(int stage,const NVNshaderData& sd,bool force=false) {
     std::ofstream(shader_directory+"/"+key+".facts.json")<<facts.dump(2);
 }
 struct Shader {VkShaderModule module{};Json reflection;std::unique_ptr<ShaderReflection> resources;std::vector<uint8_t> c1;std::set<uint32_t> inputs;bool facts_recorded=false;
+    // True when the offline cache has no translation for this key. Such a stage
+    // has no module, so the draw that needs it is skipped instead of built.
+    bool missing=false;
+    // The translated shader declares a uniform block at binding 0 that the
+    // reflection does not name. That block is the renderer's own support buffer:
+    // it carries the platform fields the shader reads but the title never binds
+    // (render scale, BGRA swap, viewport transform). Left unbound it reads as
+    // zero, and a zero render scale collapses every vertex of the draw onto one
+    // point -- a frame that looks empty while every command was accepted.
+    bool needs_support_buffer=false;
+    // Storage class each binding was declared with, keyed by binding number.
+    // The reflection groups a resource by what NVN called it; the descriptor type
+    // has to follow what the translated shader actually declares. A buffer NVN
+    // called a storage table can come out as a uniform block, and binding it as a
+    // storage buffer then leaves the shader reading a descriptor of the wrong kind
+    // -- which no amount of correct data makes work.
+    std::map<uint32_t,uint32_t> binding_storage;
     std::vector<ShaderIntegerImage> last_integer_formats;VkShaderModule last_integer_module{};
 };
 std::map<std::string,Shader> shaders;
@@ -183,7 +200,37 @@ Shader& shader_for(const NVNshaderData& sd,const std::string& key) {
     if(auto it=shaders.find(key);it!=shaders.end())return it->second;
     auto base=shader_binary_directory+"/"+key;
     if(!std::filesystem::exists(base+".spv") || !std::filesystem::exists(base+".res.json")){
-        if(complete_shader_cache)ot2_host_die("Offline shader cache does not contain %s",key.c_str());
+        // The cache shipped before the code area took part in the key is named by
+        // the control section alone. A hit there is a translation of a *sibling*
+        // shader: this title has 613 shaders that share a control section and
+        // differ only in code, so the control-only name cannot tell them apart.
+        // Using the sibling keeps the draw instead of skipping it, and the
+        // substitution is counted so the gap is visible in the log rather than
+        // looking like the shader simply worked.
+        if(sd.control){
+            const auto legacy=shader_key(reinterpret_cast<const void*>(sd.control));
+            const auto legacy_base=shader_binary_directory+"/"+legacy;
+            if(legacy!=key && std::filesystem::exists(legacy_base+".spv") && std::filesystem::exists(legacy_base+".res.json")){
+                static std::atomic<unsigned> substituted{0};
+                if(substituted.fetch_add(1,std::memory_order_relaxed)<32)
+                    ot2_host_log("SHADER_FALLBACK %s -> %s (sibling that shares the control section)",key.c_str(),legacy.c_str());
+                return shader_for(sd,legacy);
+            }
+        }
+        // A complete cache that lacks this key means the packaged translation set
+        // does not cover a shader this title builds. Stopping the whole process at
+        // that point costs every remaining frame for one effect, so the stage gets
+        // a placeholder that carries no module: the draw which needs it is skipped
+        // and the key is named in the log for a later offline pass to translate.
+        if(complete_shader_cache){
+            Shader placeholder;placeholder.missing=true;
+            placeholder.reflection=Json{{"key",key},{"cbufs",Json::array()},{"sbufs",Json::array()},{"textures",Json::array()},{"images",Json::array()}};
+            placeholder.resources=std::make_unique<ShaderReflection>(placeholder.reflection);
+            static std::atomic<unsigned> reported{0};
+            if(reported.fetch_add(1,std::memory_order_relaxed)<32)
+                ot2_host_log("SHADER_MISSING %s (not in the offline cache; draws using it are skipped)",key.c_str());
+            return shaders.emplace(key,std::move(placeholder)).first->second;
+        }
         ot2_host_log("WAIT_SHADER key=%s",key.c_str());
         for(int i=0;i<3000 && (!std::filesystem::exists(base+".spv") || !std::filesystem::exists(base+".res.json"));i++)std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -192,14 +239,61 @@ Shader& shader_for(const NVNshaderData& sd,const std::string& key) {
     if(size<20 || size%4)ot2_host_die("Invalid shader size: %s",key.c_str());std::vector<uint32_t> words(size/4);binary.seekg(0);binary.read(reinterpret_cast<char*>(words.data()),size);
     if(words[0]!=0x07230203)ot2_host_die("Invalid shader header: %s",key.c_str());
     Shader s;std::ifstream meta(base+".res.json");if(!meta)ot2_host_die("Shader metadata missing: %s",key.c_str());meta>>s.reflection;s.resources=std::make_unique<ShaderReflection>(s.reflection);if(s.resources->key!=key)ot2_host_die("Shader reflection key mismatch");
-    std::set<uint32_t> input_ids;std::map<uint32_t,uint32_t> locations;
+    std::set<uint32_t> input_ids;std::map<uint32_t,uint32_t> locations;std::set<uint32_t> member_locations;
+    std::set<uint32_t> binding_zero;
     for(size_t at=5;at<words.size();) {auto count=words[at]>>16,op=words[at]&65535;if(!count || at+count>words.size())ot2_host_die("Corrupt SPIR-V instruction");
         if(op==59 && count>=4 && words[at+3]==1)input_ids.insert(words[at+2]);
-        if(op==71 && count>=4 && words[at+2]==30)locations[words[at+1]]=words[at+3];at+=count;}
+        if(op==71 && count>=4 && words[at+2]==30)locations[words[at+1]]=words[at+3];
+        // A vertex input declared as a struct carries its Location on the struct
+        // member, not on the variable. glslang emits that form for cross-compiled
+        // HLSL. Only scanning the variable decoration therefore reports "the
+        // shader reads nothing but position" for a shader that reads seven inputs,
+        // and the pipeline is then built without those attributes.
+        if(op==72 && count>=5 && words[at+3]==30)member_locations.insert(words[at+4]);
+        // Decoration 33 is Binding. Collected for every id first, then matched
+        // against the variables below: an id can carry a binding and not be the
+        // variable that uses it.
+        if(op==71 && count>=4 && words[at+2]==33 && words[at+3]==0)binding_zero.insert(words[at+1]);
+        at+=count;}
     for(auto id:input_ids)if(locations.contains(id))s.inputs.insert(locations[id]);
+    s.inputs.insert(member_locations.begin(),member_locations.end());
+    // Binding 0 as a Uniform variable is the support buffer. Any other storage
+    // class at 0 would be a resource the reflection can name, and a binding the
+    // reflection already names is not this one.
+    for(size_t at=5;at<words.size();){auto count=words[at]>>16,op=words[at]&65535;if(!count||at+count>words.size())break;
+        if(op==59 && count>=4 && words[at+3]==2 && binding_zero.contains(words[at+2]))s.needs_support_buffer=true;at+=count;}
+    for(const auto& list:{s.resources->cbufs,s.resources->sbufs,s.resources->textures,s.resources->images})
+        for(const auto& r:list)if(r.binding==0)s.needs_support_buffer=false;
+    // Binding number -> storage class, straight from the variable declarations.
+    // A variable carries both Binding (33) and its storage class; matching them up
+    // needs the decoration and the OpVariable for the same id.
+    {std::map<uint32_t,uint32_t> binding_of;
+     for(size_t at=5;at<words.size();){auto count=words[at]>>16,op=words[at]&65535;if(!count||at+count>words.size())break;
+        if(op==71&&count>=4&&words[at+2]==33)binding_of[words[at+1]]=words[at+3];at+=count;}
+     for(size_t at=5;at<words.size();){auto count=words[at]>>16,op=words[at]&65535;if(!count||at+count>words.size())break;
+        if(op==59&&count>=4){auto it=binding_of.find(words[at+2]);if(it!=binding_of.end())s.binding_storage[it->second]=words[at+3];}
+        at+=count;}}
+    {char probe[128]={0};size_t at=0;
+     for(auto loc:s.inputs)at+=size_t(snprintf(probe+at,sizeof probe-at,"%s%u",at?",":"",loc));
+     static std::atomic<unsigned> reported_inputs{0};
+     if(reported_inputs.fetch_add(1,std::memory_order_relaxed)<40)
+         ot2_host_log("SHADER_INPUTS key=%s variables=%zu members=%zu used=[%s]",key.c_str(),locations.size(),member_locations.size(),probe);}
     auto* control=static_cast<const uint8_t*>(sd.control);uint32_t offset=0,total=0;memcpy(&offset,control+0x700,4);memcpy(&total,control+0x704,4);
     if(offset>total || total>8*1024*1024)ot2_host_die("Invalid shader constants");
     auto* code=reinterpret_cast<const uint8_t*>(sd.data);s.c1.assign(code+offset,code+total);
+    // The constant segment a shader carries has to be identified from the data,
+    // not assumed: the same word at control+0x700 is a length in one toolchain and
+    // something else in another, and taking the wrong pair hands the vertex stage
+    // a matrix of garbage that scales the whole draw to a point. Printed next to
+    // the control header so the two can be compared once and settled.
+    {static std::atomic<unsigned> reported{0};
+     if(reported.fetch_add(1,std::memory_order_relaxed)<12){
+        char head[3*32+1]={0};
+        for(int i=0;i<32;i++)snprintf(head+i*3,4,"%02x ",control[i]);
+        char body[3*32+1]={0};
+        for(int i=0;i<32&&size_t(i)<s.c1.size();i++)snprintf(body+i*3,4,"%02x ",s.c1[i]);
+        ot2_host_log("SHADER_CONST key=%s off=%u total=%u c1=%zu ctl[0..32]=%s c1[0..32]=%s",
+            key.c_str(),offset,total,s.c1.size(),head,body);}}
     s.module=shared_shader_module(words.data(),words.size());
     return shaders.emplace(key,std::move(s)).first->second;
 }
@@ -208,7 +302,30 @@ const NVNshaderData& stage_data(int stage) {
     return p->value.sd[p->stages[stage]];
 }
 Shader& stage_shader(int stage){
-    if(!bound_shaders[stage]){auto& p=bound_programs[stage];const auto& data=stage_data(stage);bound_shaders[stage]=&shader_for(data,p->keys[p->stages[stage]]);}
+    if(!bound_shaders[stage]){
+        auto& p=bound_programs[stage];
+        // A program bound to a stage slot that carries no shader for it. The real
+        // device would not be asked this either, but a title can leave a slot
+        // bound from an earlier program; dying here stops every later frame, so
+        // report which program it was and let the draw be skipped like any other
+        // stage this host cannot build.
+        if(!p || p->stages[stage]<0){
+            static Shader absent;absent.missing=true;
+            static std::atomic<unsigned> reported{0};
+            if(reported.fetch_add(1,std::memory_order_relaxed)<16){
+                char keys[160]={};size_t used=0;
+                if(p) for(int i=0;i<6&&i<int(p->value.nstage);i++)
+                    used+=size_t(snprintf(keys+used,sizeof(keys)-used,"%s%s",i?" ":"",p->keys[i].c_str()));
+                ot2_host_log("STAGE_ABSENT stage=%d nstage=%u resolved=[%d %d %d %d %d %d] keys=%s",
+                    stage,p?p->value.nstage:0,
+                    p?(p->stages[0]>=0?1:0):0,p?(p->stages[1]>=0?1:0):0,p?(p->stages[2]>=0?1:0):0,
+                    p?(p->stages[3]>=0?1:0):0,p?(p->stages[4]>=0?1:0):0,p?(p->stages[5]>=0?1:0):0,keys);
+            }
+            return absent;
+        }
+        const auto& data=p->value.sd[p->stages[stage]];
+        bound_shaders[stage]=&shader_for(data,p->keys[p->stages[stage]]);
+    }
     return *bound_shaders[stage];
 }
 uint64_t constant_bank_expanded_bytes=0;
@@ -251,8 +368,39 @@ uint32_t packed_handle(const ShaderResource& r,int stage,const Shader& shader) {
     return result;
 }
 struct StorageBinding {uint64_t address;uint32_t size;};
-StorageBinding storage_binding(int stage,const ShaderResource& resource,const Shader& shader){
-    const size_t offset=size_t(resource.cb_offset)*4;
+// The renderer's support buffer, laid out as the translated shaders expect it:
+//   +0    alpha_test        u32
+//   +16   is_bgra           u32[8]
+//   +144  viewport_inverse  f4
+//   +160  viewport_size     f4
+//   +176  frag_scale_count  i32
+//   +192  render_scale      f4[73]   (only .x is read)
+// Everything else is zero, which is what the platform fills in when alpha test is
+// off and the destination is not BGRA. render_scale is the entry that must not be
+// zero: the vertex stage multiplies the projected position by it, so an unbound
+// buffer scales the whole draw to nothing.
+std::vector<uint8_t> support_buffer_bytes(){
+    // Mirror of the renderer support buffer every translated shader declares at
+    // binding 0. The platform fills these fields in before the shader runs; a zero
+    // left here is not "no effect", it is a value the vertex stage multiplies by.
+    //   +0    alpha_test        u32
+    //   +16   is_bgra           u32[8]
+    //   +144  viewport_inverse  f4
+    //   +160  viewport_size     f4
+    //   +176  frag_scale_count  i32
+    //   +192  render_scale      f4[73]
+    std::vector<uint8_t> bytes(1392,0);
+    const float width=1280.f, height=720.f;
+    auto put=[&](size_t offset,float x,float y,float z,float w){
+        auto* p=reinterpret_cast<float*>(bytes.data()+offset);
+        p[0]=x;p[1]=y;p[2]=z;p[3]=w;};
+    put(144,2.f/width,2.f/height,1.f,1.f);   // viewport_inverse
+    put(160,width,height,0.f,0.f);           // viewport_size
+    *reinterpret_cast<uint32_t*>(bytes.data()+176)=1;   // frag_scale_count
+    for(int i=0;i<73;i++)put(192+size_t(i)*16,1.f,1.f,1.f,1.f);   // render_scale
+    return bytes;
+}
+StorageBinding storage_binding(int stage,const ShaderResource& resource,const Shader& shader){    const size_t offset=size_t(resource.cb_offset)*4;
     if(offset>65536-12)ot2_host_die("Storage-buffer table offset invalid");
     if(direct_storage_decode){
         const auto word=resource.cb_offset;const auto slot=resource.cb_slot;
@@ -664,15 +812,91 @@ struct DrawResources {
             for(int bank=3;bank<19;bank++)if(mask&(1u<<bank)){auto& u=render_state.uniforms[stage][bank-3];dependencies.watch(reinterpret_cast<const void*>(u.addr),u.size);}
         }
         if(group<0||group==0)for(auto& r:shader.resources->cbufs){int slot=r.slot;
-            if(slot>=3&&slot<19){const auto& u=render_state.uniforms[stage][slot-3];if(u.size>65536||(!u.addr&&u.size))ot2_host_die("Invalid uniform range");buffer(r.binding,reinterpret_cast<const void*>(u.addr),u.size,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,false,true);}
+            if(slot>=3&&slot<19){const auto& u=render_state.uniforms[stage][slot-3];if(u.size>65536||(!u.addr&&u.size))ot2_host_die("Invalid uniform range");
+                // Diagnostic: the first constant bank carries a projection and then
+                // a second 4x4 that differs on every draw, which is the shape of a
+                // per-element transform. Replacing that second block with "map 0..1
+                // to clip space" answers whether the vertex stage reads it at all:
+                // the matrix is symmetric under row- and column-major reading, so a
+                // frame that fills is unambiguous. Written as an affine matrix so
+                // w ends at 1 either way, which the title's own block does not.
+                if(ui_matrix_probe&&stage==0&&u.addr&&u.size>=128){
+                    static std::vector<uint8_t> probe_bank(65536);
+                    const size_t n=std::min<size_t>(u.size,probe_bank.size());
+                    memcpy(probe_bank.data(),reinterpret_cast<const void*>(u.addr),n);
+                    auto* f=reinterpret_cast<float*>(probe_bank.data());
+                    const size_t count=n/4;
+                    if(count>=32){
+                        const float m[16]={2,0,0,-1, 0,2,0,-1, 0,0,1,0, 0,0,0,1};
+                        for(int k=0;k<16;k++)f[16+k]=m[k];
+                        static std::atomic<unsigned> reported{0};
+                        if(reported.fetch_add(1,std::memory_order_relaxed)<64)
+                            ot2_host_log("UI_MATRIX_PROBE slot=%d size=%zu",slot,n);
+                    }
+                }
+                // Diagnostic: a 2D sprite program places a unit quad through a
+                // model matrix whose scale is the sprite's size in pixels. Scaling
+                // that matrix here tells the two possible causes apart -- the quad
+                // is too small for the screen, or the draw never reaches the
+                // rasteriser at all -- without touching the title's memory.
+                if(sprite_pixels_forced&&stage==0&&u.addr&&u.size>=112&&sprite_scale_probe){
+                    static std::vector<uint8_t> probe_bank(65536);
+                    const size_t n=std::min<size_t>(u.size,probe_bank.size());
+                    memcpy(probe_bank.data(),reinterpret_cast<const void*>(u.addr),n);
+                    auto* f=reinterpret_cast<float*>(probe_bank.data());
+                    for(int k:{16,21,26})f[k]*=sprite_scale_probe;
+                    buffer(r.binding,probe_bank.data(),n,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,false,true,true);
+                    continue;
+                }
+                // A title binds only the bytes it considers live, and the shader
+                // declares a fixed struct. On the console the slot is one physical
+                // driver segment, so a read past the bound range finds whatever the
+                // title left there -- and a title does leave data there: the bank at
+                // 912 bytes carries a rotation and translation starting exactly at
+                // 912. Here the range is a descriptor limit, so those reads return
+                // nothing. Extending the range to the end of the containing page
+                // gives the shader what the console would, without ever crossing
+                // into memory the title has not mapped.
+                constexpr size_t uniform_page=4096;
+                const size_t page_end=(size_t(u.addr)+uniform_page)&~(uniform_page-1);
+                const size_t reach=std::min<size_t>(uniform_page,page_end-size_t(u.addr));
+                if(u.addr&&reach>u.size){
+                    static thread_local std::vector<uint8_t> padded;
+                    padded.assign(reach,0);
+                    const auto* source=reinterpret_cast<const uint8_t*>(u.addr);
+                    memcpy(padded.data(),source,u.size);
+                    if(uniform_tail_from_memory)memcpy(padded.data()+u.size,source+u.size,reach-u.size);
+                    buffer(r.binding,padded.data(),padded.size(),VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,false,true);
+                    static std::atomic<unsigned> reported{0};
+                    if(reported.fetch_add(1,std::memory_order_relaxed)<8)
+                        ot2_host_log("UNIFORM_EXTENDED slot=%d declared=%zu bound=%zu tail=%s",slot,u.size,reach,
+                            uniform_tail_from_memory?"memory":"zero");
+                }
+                else buffer(r.binding,reinterpret_cast<const void*>(u.addr),u.size,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,false,true);}
             else if(slot==1){buffer(r.binding,shader.c1.data(),shader.c1.size(),VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,false,true,true);}
             else {adopt(r.binding,cached_bank(stage,slot,shader),VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);}}
+        if((group<0||group==0)&&shader.needs_support_buffer&&
+           std::none_of(bindings.begin(),bindings.end(),[](const auto& b){return b.binding==0;})){
+            // Filled once: the platform fields do not depend on the draw.
+            static const std::vector<uint8_t> bytes=support_buffer_bytes();
+            buffer(0,bytes.data(),bytes.size(),VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,false,true,true);
+        }
         if(group<0||group==1)for(auto& r:shader.resources->sbufs){auto b=storage_binding(stage,r,shader);
+            // What NVN calls a storage table can come out of the translator as a
+            // uniform block; the descriptor has to match the declaration or the
+            // shader reads a descriptor of the wrong kind and every value it loads
+            // is undefined, however correct the bytes behind it are.
+            auto declared=shader.binding_storage.find(r.binding);
+            const bool as_uniform=declared!=shader.binding_storage.end()&&declared->second==2u;
+            const VkDescriptorType type=as_uniform?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            if(as_uniform){static std::atomic<unsigned> reported{0};
+                if(reported.fetch_add(1,std::memory_order_relaxed)<48)
+                    ot2_host_log("SBUF_AS_UNIFORM binding=%u size=%u (translator emitted a uniform block)",r.binding,b.size);}
             if(!b.address&&!b.size){
                 if(!null_descriptors){null_bindings.push_back(r.binding);continue;}
-                bindings.push_back({r.binding,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,current_stage,nullptr});writes.push_back({r.binding,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,buffer_infos.size(),false});buffer_infos.push_back({VK_NULL_HANDLE,0,VK_WHOLE_SIZE});continue;
+                bindings.push_back({r.binding,type,1,current_stage,nullptr});writes.push_back({r.binding,type,buffer_infos.size(),false});buffer_infos.push_back({VK_NULL_HANDLE,0,VK_WHOLE_SIZE});continue;
             }
-            if(!b.address || !b.size)ot2_host_die("Storage buffer is not bound");buffer(r.binding,reinterpret_cast<const void*>(b.address),b.size,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,(uint32_t(r.flags)&1)!=0,(uint32_t(r.flags)&1)==0);}
+            if(!b.address || !b.size)ot2_host_die("Storage buffer is not bound");buffer(r.binding,reinterpret_cast<const void*>(b.address),b.size,type,(uint32_t(r.flags)&1)!=0,(uint32_t(r.flags)&1)==0);}
         if(group<0||group==2)for(auto& r:shader.resources->textures)image(r,stage,shader,false);if(group<0||group==3)for(auto& r:shader.resources->images)image(r,stage,shader,true);
     }
     void finish() {
@@ -932,7 +1156,7 @@ void prepare_buffer_mirrors(std::span<const std::pair<int,Shader*>> stages,uint3
         for(auto& r:shader->resources->cbufs)if(r.slot>=3){auto& u=render_state.uniforms[stage][r.slot-3];add(u.addr,u.size,65536,false,true);}
         for(int image=0;image<2;image++)for(auto& r:image?shader->resources->images:shader->resources->textures){auto handle=packed_handle(r,stage,*shader);auto* descriptor=texture_descriptor(handle&0xfffff);if(!descriptor)continue;auto& t=descriptor->texture;
             if(t.d.target==NVN_TEXTURE_TARGET_BUFFER){int bw,bh;add(uintptr_t(t.mem),size_t(nvn_fmt_bpb(t.d.format,&bw,&bh))*t.d.width,0,image&&(r.flags&4));}else if(t.mem){ensure_cpu_buffer(uintptr_t(t.mem),t.L.size);add(uintptr_t(t.mem),t.L.size,0,false,true);}}
-        if(stage==0)for(auto location:shader->inputs){if(location>=16)ot2_host_die("Vertex attribute exceeds host ABI");auto& attr=render_state.attributes[location];if(attr.stream>=16)ot2_host_die("Vertex stream exceeds host ABI");auto& b=render_state.vertex_buffers[attr.stream];add(b.address,b.size,0,false);}
+        if(stage==0)for(auto location:shader->inputs){if(location>=16)ot2_host_die("Vertex attribute exceeds host ABI");auto& attr=render_state.attributes[location];if(!attr.fmt)continue;if(attr.stream>=16)ot2_host_die("Vertex stream exceeds host ABI");auto& b=render_state.vertex_buffers[attr.stream];add(b.address,b.size,0,false);}
     }
     if(operation==OP_DRAW_IDX){auto& p=*reinterpret_cast<const p_draw_idx*>(parameters);auto size=size_t(p.count)*(p.itype==0?1:p.itype==1?2:4);ensure_cpu_buffer(p.ibuf,size);add(p.ibuf,size,0,false,true);}
     for(const auto& u:uses)if(previous_cpu_overlap(u.address,u.size)){flush_commands();break;}
@@ -951,6 +1175,33 @@ void prepare_buffer_mirrors(std::span<const std::pair<int,Shader*>> stages,uint3
 #include "pass_plan.inc"
 void execute_draw(uint32_t operation,const uint8_t* parameters) {
     if(operation!=OP_DISPATCH && !render_state.render_enable)return;
+    // Conditional render: compare the two sampled counters the title bracketed its
+    // occlusion test with (NVNcounterData::counter at addr and addr+16).
+    //
+    // The comparison is deliberately conservative. The second sample is written by
+    // the GPU some frames later, so at draw time the pair can still read as equal
+    // because neither has been filled yet -- and treating that as "nothing passed"
+    // would hide content that is actually visible. Only a decided answer skips the
+    // draw; an undecided one draws, which costs overdraw instead of geometry that
+    // disappears. A title whose counters never arrive therefore renders more than
+    // it should, never less.
+    if(operation!=OP_DISPATCH && render_state.render_cond_mode>=0) {
+        if(!render_state.render_cond_addr) return;      // no storage named: nothing can pass
+        const auto* cond=reinterpret_cast<const uint64_t*>(render_state.render_cond_addr);
+        const uint64_t before=cond[0],after=cond[2];    // counter fields, stride sizeof(NVNcounterData)
+        static std::atomic<unsigned> reported{0};
+        if(!before&&!after) {
+            ++undecided_conditional_draws;
+            if(reported.fetch_add(1,std::memory_order_relaxed)<8)
+                ot2_host_log("RENDER_COND undecided at %#llx (both counters zero); drawing",
+                             (unsigned long long)render_state.render_cond_addr);
+        } else {
+            const bool equal=before==after;
+            const bool render=render_state.render_cond_mode==0?equal:!equal;
+            ++decided_conditional_draws;
+            if(!render){++skipped_conditional_draws;return;}
+        }
+    }
     if(operation==OP_DRAW_IDX){auto& p=*reinterpret_cast<const p_draw_idx*>(parameters);if(p.count<0||p.itype<0||p.itype>2||(p.count&&!p.ibuf))ot2_host_die("Invalid indexed draw range");}
     // No shader invocation or query sample can result from an empty launch.
     // Do not skip non-empty draws based solely on their color/depth output.
@@ -970,7 +1221,16 @@ void execute_draw(uint32_t operation,const uint8_t* parameters) {
     // Unrelated storage writes in older batches are not a dependency.
     if(!precise_draw_dependencies)ensure_previous_cpu_writes();
     bool side_effects=false;std::array<std::pair<int,Shader*>,6> shader_stages;size_t stage_count=0;
-    for(int stage=0;stage<6;stage++)if(render_state.programs[stage]&&((operation==OP_DISPATCH)==(stage==5)))shader_stages[stage_count++]={stage,&stage_shader(stage)};
+    for(int stage=0;stage<6;stage++)if(render_state.programs[stage]&&((operation==OP_DISPATCH)==(stage==5))){
+        Shader& sh=stage_shader(stage);
+        if(sh.missing){
+            static std::atomic<unsigned> reported{0};++skipped_missing_draws;
+            if(reported.fetch_add(1,std::memory_order_relaxed)<24)
+                ot2_host_log("DRAW_SKIPPED stage=%d operation=%u (shader not translated)",stage,operation);
+            return;
+        }
+        shader_stages[stage_count++]={stage,&sh};
+    }
     const bool emulate_depth=operation!=OP_DISPATCH&&!depth_bounds_supported&&render_state.depth_bounds.enable;
     bool emulate_samples=operation!=OP_DISPATCH&&samples_active&&geometry_query_workaround&&render_state.programs[2];
     bool check_sample_shape=emulate_samples;
@@ -1051,19 +1311,126 @@ void execute_draw(uint32_t operation,const uint8_t* parameters) {
         VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};rendering.colorAttachmentCount=render_targets.n;rendering.pColorAttachmentFormats=colors;rendering.depthAttachmentFormat=depth_format;
         // Packed depth/stencil is detached only when neither aspect participates.
         // Keep dimensions/layers above, so clipping and render extent do not change.
-        const bool detach_depth=prune_unused_depth&&render_targets.depth&&!render_state.depth_stencil.dt&&!render_state.depth_stencil.st&&!render_state.depth_bounds.enable;
+        //
+        // A depth image smaller than the rendering area is detached as well. This
+        // title switches to a colour target of its own size for the 2D and
+        // composite passes while the depth image still belongs to the 1280x720
+        // scene pass, and Vulkan leaves a rendering area outside an attachment
+        // undefined: every draw then writes nothing and reports no error. Those
+        // passes are two-dimensional and test no depth, so dropping the attachment
+        // costs them nothing and is what puts the frame on screen.
+        bool depth_too_small=false;
+        if(render_targets.depth) {
+            const auto dw=uint32_t(render_targets.depth->d.width), dh=uint32_t(render_targets.depth->d.height);
+            static std::atomic<unsigned> reported{0};
+            if(reported.fetch_add(1,std::memory_order_relaxed)<12)
+                ot2_host_log("DEPTH_ATTACH depth %ux%u fmt=%u serial=%llu vs rendering %ux%u (dt=%d dw=%d df=%d)",
+                    dw,dh,render_targets.depth->d.format,(unsigned long long)render_targets.depth->serial,
+                    extent.width,extent.height,render_state.depth_stencil.dt,render_state.depth_stencil.dw,render_state.depth_stencil.df);
+            if(dw && dh && (dw<extent.width || dh<extent.height)) depth_too_small=true;
+        } else {
+            static std::atomic<unsigned> none{0};
+            if(none.fetch_add(1,std::memory_order_relaxed)<4)
+                ot2_host_log("DEPTH_ATTACH none (rendering %ux%u dt=%d)",extent.width,extent.height,render_state.depth_stencil.dt);
+        }
+        // The guard on render_targets.depth is load-bearing: everything behind
+        // detach_depth dereferences the attachment, so a pass without a depth
+        // image must never be able to set it.
+        const bool detach_depth=render_targets.depth&&(depth_too_small||force_no_depth||(prune_unused_depth&&!render_state.depth_stencil.dt&&!render_state.depth_stencil.st&&!render_state.depth_bounds.enable));
         if(detach_depth){materialize_clears(render_targets.depth->serial);depth_format=VK_FORMAT_UNDEFINED;depth.imageView={};rendering.depthAttachmentFormat=depth_format;++pruned_depth;}
         bool stencil=depth_format==VK_FORMAT_D24_UNORM_S8_UINT || depth_format==VK_FORMAT_D32_SFLOAT_S8_UINT;if(stencil)rendering.stencilAttachmentFormat=depth_format;
         // Vertex addresses/ranges are draw inputs, not immutable PSO state.
         std::array<std::pair<unsigned,size_t>,16> vertex_buffers{};size_t vertex_buffer_count=0;uint32_t bound_streams=0;
-        for(auto loc:vertex->inputs){if(loc>=16)ot2_host_die("Vertex location >=16 pending");const auto& a=render_state.attributes[loc];if(!a.fmt)ot2_host_die("Vertex attribute %u unbound",loc);
+        for(auto loc:vertex->inputs){if(loc>=16)ot2_host_die("Vertex location >=16 pending");const auto& a=render_state.attributes[loc];
+            // A shader input the title never gave a format. The console feeds a
+            // disabled attribute in that case, and a title that omits one either
+            // does not read it or does not care what it holds. Vulkan leaves the
+            // value undefined when no attribute description is provided, which is
+            // the closest match; dying here instead would end the run at the first
+            // draw that leaves one out, which is what this used to do.
+            if(!a.fmt){static std::atomic<unsigned> reported{0};++unbound_attribute_draws;
+                if(reported.fetch_add(1,std::memory_order_relaxed)<16)
+                    ot2_host_log("ATTRIBUTE_UNBOUND location=%d (shader reads it, title never bound it)",loc);
+                continue;}
             if(a.stream>=16)ot2_host_die("Vertex stream exceeds host ABI");
             if(!(bound_streams&(1u<<a.stream))){bound_streams|=1u<<a.stream;
                 const auto& stream=render_state.streams[a.stream];if(stream.divisor>1)ot2_host_die("Instance divisor >1 pending");
                 auto& b=render_state.vertex_buffers[a.stream];if(!b.address || !b.size)ot2_host_die("Vertex buffer %u unbound",uint32_t(a.stream));uint64_t attribute_end=0;
                 for(auto location:vertex->inputs){const auto& attr=render_state.attributes[location];if(attr.stream==a.stream)attribute_end=std::max<uint64_t>(attribute_end,attr.offset+16);}
                 uint64_t prefix=(stream.divisor?instance_end:vertex_end)*stream.stride+attribute_end;
-                vertex_buffers[vertex_buffer_count++]={a.stream,resources.buffers.size()};resources.buffers.push_back(readonly_buffer(reinterpret_cast<void*>(b.address),std::min<uint64_t>(b.size,prefix),VK_BUFFER_USAGE_VERTEX_BUFFER_BIT));}}
+                vertex_buffers[vertex_buffer_count++]={a.stream,resources.buffers.size()};
+                // Diagnostic: the projection this draw carries maps pixels to clip
+                // space (1/640, -1/360), so a vertex of 0..1 lands inside one pixel.
+                // Rewriting the positions as pixel coordinates with the same winding
+                // answers whether the geometry is expected in pixels: content in the
+                // lower-right quadrant means yes and the values the title supplies
+                // are not reaching us intact; no content means this draw is not the
+                // one that draws the panel.
+                if(sprite_pixels_forced&&vertex->inputs.size()<=1&&a.stream==0&&a.offset==0&&
+                   stream.stride==28&&stream.divisor==0){
+                    const size_t vertices=size_t(std::max<uint64_t>(vertex_end,4));
+                    const size_t bytes=vertices*stream.stride;
+                    if(bytes<=1u<<20){
+                        std::vector<uint8_t> copy(bytes);
+                        memcpy(copy.data(),reinterpret_cast<const void*>(b.address),std::min<size_t>(bytes,b.size));
+                        const float corners[4][2]={{0.f,0.f},{640.f,0.f},{0.f,360.f},{640.f,360.f}};
+                        for(size_t v=0;v<vertices;v++){
+                            auto* f=reinterpret_cast<float*>(copy.data()+v*stream.stride);
+                            f[0]=corners[v%4][0];f[1]=corners[v%4][1];f[2]=0.f;}
+                        resources.buffers.push_back(make_buffer(copy.data(),copy.size(),VK_BUFFER_USAGE_VERTEX_BUFFER_BIT));
+                        static std::atomic<unsigned> reported{0};
+                        if(reported.fetch_add(1,std::memory_order_relaxed)<6)
+                            ot2_host_log("SPRITE_PIXEL_POS stride=%u vertices=%zu",uint32_t(stream.stride),vertices);
+                        continue;
+                    }
+                }
+                // Diagnostic: the per-instance record is what gives a normalised
+                // unit quad its size on screen. Overwriting the rect with a real
+                // rectangle tells whether that attribute is the size source at all:
+                // a frame that fills proves it is and that the title's own value is
+                // being read from the wrong place; an unchanged frame proves the
+                // size lives somewhere the vertex stage never sees.
+                if(sprite_pixels_forced&&a.stream==1&&stream.stride>0&&stream.stride<=256&&
+                   render_state.attributes[6].stream==1){
+                    const size_t instances=size_t(std::max<uint64_t>(instance_end,1));
+                    const size_t bytes=(instances+1)*stream.stride;
+                    if(bytes<=8u<<20&&b.size>=bytes){
+                        std::vector<uint8_t> copy(bytes);
+                        memcpy(copy.data(),reinterpret_cast<const void*>(b.address),bytes);
+                        const uint32_t off=render_state.attributes[6].offset;
+                        for(size_t k=0;k<instances;k++){
+                            auto* f=reinterpret_cast<float*>(copy.data()+k*stream.stride+off);
+                            f[0]=0.f;f[1]=0.f;f[2]=sprite_rect_w;f[3]=sprite_rect_h;}
+                        resources.buffers.push_back(make_buffer(copy.data(),copy.size(),VK_BUFFER_USAGE_VERTEX_BUFFER_BIT));
+                        static std::atomic<unsigned> reported{0};
+                        if(reported.fetch_add(1,std::memory_order_relaxed)<4)
+                            ot2_host_log("SPRITE_RECT_FORCED off=%u stride=%u instances=%zu rect=%gx%g",
+                                off,uint32_t(stream.stride),instances,double(sprite_rect_w),double(sprite_rect_h));
+                        continue;
+                    }
+                }
+                // Diagnostic: a 2D sprite program can place each sprite from a
+                // per-instance rectangle instead of from the vertex buffer. The
+                // title hands over a unit rectangle, so if the shader reads it the
+                // sprite is one pixel wide and the frame looks empty while every
+                // draw is in fact correct. Scaling a copy of that rectangle tells
+                // the two apart: a frame that grows proves the attribute is read
+                // and that the size comes from somewhere else.
+                if(sprite_instance_scale!=1.f&&a.stream==1&&stream.stride>0&&stream.stride<=256&&
+                   render_state.attributes[6].stream==1){
+                    const size_t instances=size_t(instance_end?instance_end:1);
+                    const size_t bytes=(instances+1)*stream.stride;
+                    if(bytes<=8u<<20&&b.size>=bytes){
+                        std::vector<uint8_t> copy(bytes);
+                        memcpy(copy.data(),reinterpret_cast<const void*>(b.address),bytes);
+                        for(size_t k=0;k<instances;k++){
+                            auto* f=reinterpret_cast<float*>(copy.data()+k*stream.stride+render_state.attributes[6].offset);
+                            f[0]*=sprite_instance_scale;f[1]*=sprite_instance_scale;}
+                        resources.buffers.push_back(make_buffer(copy.data(),copy.size(),VK_BUFFER_USAGE_VERTEX_BUFFER_BIT));
+                        continue;
+                    }
+                }
+                resources.buffers.push_back(readonly_buffer(reinterpret_cast<void*>(b.address),std::min<uint64_t>(b.size,prefix),VK_BUFFER_USAGE_VERTEX_BUFFER_BIT));}}
         const auto& v=render_state.viewport;VkViewport vp{v[0],v[1]+v[3],v[2],-v[3],v[4],v[5]};const auto& sc=render_state.scissor;int sx=std::max(0,sc.x),sy=std::max(0,sc.y);VkRect2D scissors{{sx,sy},{uint32_t(std::max(0,std::min(int(extent.width),sc.x+sc.w)-sx)),uint32_t(std::max(0,std::min(int(extent.height),sc.y+sc.h)-sy))}};
         uint32_t attachment_samples=0;auto check_samples=[&](const tex_t* t){if(!t)return;auto samples=uint32_t(image_for(*t).samples);if(attachment_samples&&attachment_samples!=samples)ot2_host_die("Mixed attachment sample counts");attachment_samples=samples;};
         for(int i=0;i<render_targets.n;i++)check_samples(render_targets.color[i]);check_samples(render_targets.depth);
@@ -1079,19 +1446,54 @@ void execute_draw(uint32_t operation,const uint8_t* parameters) {
         else{
         ++pipeline_preparation_misses;
         std::vector<VkVertexInputAttributeDescription> attributes;std::vector<VkVertexInputBindingDescription> bindings;
-        for(auto loc:vertex->inputs){const auto& a=render_state.attributes[loc];attributes.push_back({loc,uint32_t(a.stream),format(a.fmt),uint32_t(a.offset)});}
+        for(auto loc:vertex->inputs){const auto& a=render_state.attributes[loc];if(!a.fmt)continue;attributes.push_back({loc,uint32_t(a.stream),format(a.fmt),uint32_t(a.offset)});}
         for(size_t i=0;i<vertex_buffer_count;i++){auto binding=vertex_buffers[i].first;const auto& stream=render_state.streams[binding];bindings.push_back({binding,stream.stride,stream.divisor?VK_VERTEX_INPUT_RATE_INSTANCE:VK_VERTEX_INPUT_RATE_VERTEX});}
         VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};vi.vertexBindingDescriptionCount=bindings.size();vi.pVertexBindingDescriptions=bindings.data();vi.vertexAttributeDescriptionCount=attributes.size();vi.pVertexAttributeDescriptions=attributes.data();
         VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};ia.topology=topology(primitive);
         VkPipelineViewportStateCreateInfo vs{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};vs.viewportCount=1;vs.pViewports=&vp;vs.scissorCount=1;vs.pScissors=&scissors;
-        auto& pol=render_state.polygon;VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};rs.polygonMode=pol.mode==2?VK_POLYGON_MODE_FILL:pol.mode==1?VK_POLYGON_MODE_LINE:VK_POLYGON_MODE_POINT;rs.cullMode=pol.cull;rs.frontFace=pol.front?VK_FRONT_FACE_COUNTER_CLOCKWISE:VK_FRONT_FACE_CLOCKWISE;rs.lineWidth=1;rs.depthBiasEnable=pol.offset_en!=0;rs.depthBiasConstantFactor=render_state.depth_bias.units;rs.depthBiasSlopeFactor=render_state.depth_bias.factor;rs.depthBiasClamp=render_state.depth_bias.clamp;
+        auto& pol=render_state.polygon;VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};rs.polygonMode=pol.mode==2?VK_POLYGON_MODE_FILL:pol.mode==1?VK_POLYGON_MODE_LINE:VK_POLYGON_MODE_POINT;
+        // The viewport has a negative height (line 1409): it turns Vulkan's
+        // y-down framebuffer back into the console's y-up window, which is the
+        // orientation the title's geometry and its "front face" enum are both
+        // written for. That flip also reverses the rasterised winding, and the
+        // front-face setting is defined over framebuffer-space winding, so a
+        // front-face value carried over unchanged selects the *other* side of
+        // every triangle. Culling then removes exactly what the title meant to
+        // keep: with cull disabled the draw is visible, with it enabled the draw
+        // writes nothing at all -- which is what separated the working 3D passes
+        // from every composite pass in the frame trace.
+        rs.cullMode=cull_none_forced?VK_CULL_MODE_NONE:pol.cull;
+        rs.frontFace=(pol.front?!winding_not_flipped:winding_not_flipped)?VK_FRONT_FACE_COUNTER_CLOCKWISE:VK_FRONT_FACE_CLOCKWISE;
+        rs.lineWidth=1;rs.depthBiasEnable=pol.offset_en!=0;rs.depthBiasConstantFactor=render_state.depth_bias.units;rs.depthBiasSlopeFactor=render_state.depth_bias.factor;rs.depthBiasClamp=render_state.depth_bias.clamp;
         rs.rasterizerDiscardEnable=render_state.raster_discard;rs.depthClampEnable=render_state.depth_clamp;rs.lineWidth=render_state.line_width;
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;ms.alphaToCoverageEnable=render_state.multisample.a2c;ms.pSampleMask=&render_state.sample_mask;
         if(attachment_samples)ms.rasterizationSamples=VkSampleCountFlagBits(attachment_samples);
-        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};const auto& d=render_state.depth_stencil;ds.depthTestEnable=d.dt;ds.depthWriteEnable=d.dw;ds.depthCompareOp=VkCompareOp(std::max(1,int(d.df))-1);ds.stencilTestEnable=d.st;ds.depthBoundsTestEnable=render_state.depth_bounds.enable;ds.minDepthBounds=render_state.depth_bounds.minimum;ds.maxDepthBounds=render_state.depth_bounds.maximum;
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};const auto& d=render_state.depth_stencil;ds.depthTestEnable=d.dt;ds.depthWriteEnable=d.dw;
+        // NVN_DEPTH_FUNC_EQUAL is how a title that runs a depth prepass shades only
+        // the fragments that pass already wrote: the prepass fills depth, this pass
+        // tests for exactly that value and writes no depth of its own. A depth-only
+        // pass does reach this host and writes the same image this test reads.
+        //
+        // What does not hold is the bit-exactness. The prepass and this pass run
+        // different shader stages, so their depth values differ in the last bits and
+        // EQUAL rejects every fragment: the geometry is correct and the colour target
+        // still stays empty. Widening to LEQUAL keeps what the test is for -- a
+        // fragment hidden behind the prepass surface has a larger depth and still
+        // fails -- while dropping the requirement that the two be identical.
+        // Measured by capture: with EQUAL the scene target receives nothing; with
+        // LEQUAL the same six draws accumulate content draw after draw.
+        const bool approximate_equal=render_state.depth_stencil.dt&&int(d.df)==3;
+        const int depth_function=approximate_equal?4:std::max(1,int(d.df));
+        ds.depthTestEnable=d.dt;ds.depthWriteEnable=d.dw;
+        ds.depthCompareOp=VkCompareOp(depth_function-1);ds.stencilTestEnable=d.st;ds.depthBoundsTestEnable=render_state.depth_bounds.enable;ds.minDepthBounds=render_state.depth_bounds.minimum;ds.maxDepthBounds=render_state.depth_bounds.maximum;
         ds.front={VkStencilOp(std::max(1,int(d.fail_f))-1),VkStencilOp(std::max(1,int(d.zpass_f))-1),VkStencilOp(std::max(1,int(d.zfail_f))-1),VkCompareOp(std::max(1,int(d.sf_f))-1),render_state.stencil_compare_mask[0],render_state.stencil_write_mask[0],render_state.stencil_reference[0]};
         ds.back={VkStencilOp(std::max(1,int(d.fail_b))-1),VkStencilOp(std::max(1,int(d.zpass_b))-1),VkStencilOp(std::max(1,int(d.zfail_b))-1),VkCompareOp(std::max(1,int(d.sf_b))-1),render_state.stencil_compare_mask[1],render_state.stencil_write_mask[1],render_state.stencil_reference[1]};
         VkPipelineColorBlendAttachmentState blend[8]{};for(int i=0;i<render_targets.n;i++){auto& b=render_state.blends[i];blend[i]={VkBool32((render_state.color.blend_en>>i)&1),blend_factor(b.src_rgb),blend_factor(b.dst_rgb),VkBlendOp(std::max(1,int(b.eq_rgb))-1),blend_factor(b.src_a),blend_factor(b.dst_a),VkBlendOp(std::max(1,int(b.eq_a))-1),VkColorComponentFlags((render_state.channel_mask.mask>>(4*i))&15)};}
+        // Diagnostic: draw every pass opaque. If the frame starts showing content
+        // with blending off, the geometry and the shaders are fine and the blend
+        // translation is what hides the result; if it stays identical, the draws
+        // never write these pixels at all and blending is not the cause.
+        if(opaque_blend_forced)for(int i=0;i<8;i++){blend[i].blendEnable=VK_FALSE;blend[i].srcColorBlendFactor=VK_BLEND_FACTOR_ONE;blend[i].dstColorBlendFactor=VK_BLEND_FACTOR_ZERO;blend[i].srcAlphaBlendFactor=VK_BLEND_FACTOR_ONE;blend[i].dstAlphaBlendFactor=VK_BLEND_FACTOR_ZERO;blend[i].colorWriteMask=0xf;}
         VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};cb.logicOpEnable=render_state.color.logic_op!=NVN_LOGIC_OP_COPY;cb.logicOp=VkLogicOp(render_state.color.logic_op);cb.attachmentCount=render_targets.n;cb.pAttachments=blend;memcpy(cb.blendConstants,render_state.blend_color,16);
         VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};ci.pNext=&rendering;ci.stageCount=stages.size();ci.pStages=stages.data();ci.pVertexInputState=&vi;ci.pInputAssemblyState=&ia;ci.pViewportState=&vs;ci.pRasterizationState=&rs;ci.pMultisampleState=&ms;ci.pDepthStencilState=&ds;ci.pColorBlendState=&cb;ci.layout=resources.layout;
         VkDynamicState dynamic_states[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR,VK_DYNAMIC_STATE_DEPTH_BOUNDS};VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};dynamic.dynamicStateCount=dynamic_depth_bounds?3:2;dynamic.pDynamicStates=dynamic_states;ci.pDynamicState=&dynamic;
@@ -1173,12 +1575,28 @@ void execute_draw(uint32_t operation,const uint8_t* parameters) {
         }
         uint32_t query_slot=pending_queries;if(samples_active){if(query_slot>=query_capacity)ot2_host_die("Occlusion batch overflow");++pending_queries;if(emulate_samples){if(batching)software_sample_slots.push_back({query_slot,sample_buffer});}else vkCmdBeginQuery(cmd,occlusion_query,query_slot,precise_occlusion?VK_QUERY_CONTROL_PRECISE_BIT:0);}
         bind_viewport(cmd,vp);bind_scissor(cmd,scissors);
+        // Diagnostic: paint the attachment from inside the very rendering
+        // instance the suspect draw is recorded in. If the screen changes, the
+        // pass and its command buffer do reach the GPU and the draw itself writes
+        // nothing; if it does not, the draw never had a live pass to begin with.
+        if(paint_draws_probe&&render_targets.n&&operation==OP_DRAW_IDX&&indices->count<=10){
+            VkClearAttachment paint{};paint.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;paint.colorAttachment=0;
+            paint.clearValue.color.float32[0]=1.f;paint.clearValue.color.float32[1]=0.f;paint.clearValue.color.float32[2]=1.f;paint.clearValue.color.float32[3]=1.f;
+            VkClearRect area{};area.rect={{0,0},extent};area.layerCount=1;
+            vkCmdClearAttachments(cmd,1,&paint,1,&area);
+        }
         bind_pipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,resources.pipeline);bind_descriptors(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,resources.layout,resources.set,resources.dynamic_offsets);
         // Emit after binding, including after a static draw-clear and in every
         // new recording. Never reuse the bounds stored in PreparedGraphicsPipeline.
         if(dynamic_depth_bounds&&depth_bounds_supported){const auto& bounds=render_state.depth_bounds;vkCmdSetDepthBounds(cmd,bounds.enable?bounds.minimum:0.f,bounds.enable?bounds.maximum:1.f);}
         for(auto& [binding,index]:std::span(vertex_buffers.data(),vertex_buffer_count)){VkDeviceSize offset=resources.buffers[index].offset;bind_vertex(cmd,binding,resources.buffers[index].buffer,offset);}
-        if(indexed){bind_index(cmd,ib,ib_offset,it);vkCmdDrawIndexed(cmd,indices->count,indices->instances,0,indices->base_vertex,indices->base_instance);}else vkCmdDraw(cmd,draw->count,draw->instances,draw->first,draw->base_instance);
+        // The count of draws that actually reached Vulkan, as opposed to the ones
+        // that were prepared for. A frame loop can look healthy while every draw is
+        // filtered out earlier, so this is the number to compare a blank screen
+        // against.
+        draws_submitted.fetch_add(1,std::memory_order_relaxed);
+        if(indexed){bind_index(cmd,ib,ib_offset,it);indices_submitted.fetch_add((unsigned long long)indices->count,std::memory_order_relaxed);vkCmdDrawIndexed(cmd,indices->count,indices->instances,0,indices->base_vertex,indices->base_instance);}
+        else{vertices_submitted.fetch_add((unsigned long long)draw->count,std::memory_order_relaxed);vkCmdDraw(cmd,draw->count,draw->instances,draw->first,draw->base_instance);}
         if(samples_active&&!emulate_samples)vkCmdEndQuery(cmd,occlusion_query,query_slot);
         if(!batching || side_effects)finish_commands(cmd);else ++batch_operations;
         if(samples_active&&!batching){drain_gpu_locked();uint64_t value=0;if(emulate_samples)memcpy(&value,sample_buffer.mapped,8);else check(vkGetQueryPoolResults(device,occlusion_query,query_slot,1,8,&value,8,VK_QUERY_RESULT_64_BIT),"occlusion results");counter_epoch->samples+=value;pending_queries=0;}

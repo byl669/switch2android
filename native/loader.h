@@ -28,6 +28,12 @@ public:
     explicit LoadedGame(const std::string& directory);
     ~LoadedGame();
     uintptr_t symbol(const std::string& name) const;
+    // Whether the named module imports a symbol whose name starts with prefix.
+    // A title's own code decides some host policy by which SDK entry it links
+    // against, and that decision is made before the first call, so the answer
+    // has to come from the module's symbol table rather than from a guess.
+    bool imports(const std::string& module, const std::string& prefix) const;
+    std::vector<std::string> imported_symbols(const std::string& module) const;
     std::vector<ModuleView> modules() const;
     std::vector<uintptr_t> initializers() const;
     void make_executable();

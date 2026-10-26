@@ -5,8 +5,10 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 extern "C" { __attribute__((visibility("hidden"))) GuestThread ot2_threads[GuestThreadCapacity]{}; }
+extern "C" { __attribute__((visibility("hidden"))) int32_t ot2_guest_tids[GuestThreadCapacity]{}; }
 namespace {
 pthread_key_t key;
 pthread_once_t once=PTHREAD_ONCE_INIT;
@@ -17,6 +19,9 @@ struct Owned {
     void* stack{};size_t stack_size{};
     void* signal{};size_t signal_size=2*1024*1024;
     void* callback{};size_t callback_size{};
+    // Worker entry stack, separate from the callback stack so a host-to-guest
+    // callback inside a worker does not reuse the stack the worker runs on.
+    void* worker{};size_t worker_size{};
 };
 void* allocate(size_t size,int protection){
     auto* memory=mmap(nullptr,size,protection,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
@@ -35,8 +40,11 @@ void destroy(void* value){
     // Free immutable allocation addresses, never guest-modifiable TLS/TLR.
     release(owned->tls,owned->tls_size);release(owned->stack,owned->stack_size);release(owned->signal,owned->signal_size);
     release(owned->callback,owned->callback_size);
+    release(owned->worker,owned->worker_size);
     c->host_x18=c->host_frame=c->guest_tls=c->guest_tlr=c->stack=c->stack_size=c->handle=0;
-    __atomic_store_n(&c->host_tp,0,__ATOMIC_RELEASE);live.fetch_sub(1);delete owned;
+    __atomic_store_n(&c->host_tp,0,__ATOMIC_RELEASE);
+    for(unsigned i=0;i<GuestThreadCapacity;i++) if(&ot2_threads[i]==c) ot2_guest_tids[i]=0;
+    live.fetch_sub(1);delete owned;
 }
 void initialize(){if(pthread_key_create(&key,destroy))ot2_host_die("Guest context key creation failed");}
 }
@@ -50,6 +58,11 @@ GuestThread* ot2_guest_context_create(){
     pthread_once(&once,initialize);GuestThread* c=nullptr;unsigned index=0;
     for(;index<GuestThreadCapacity;++index){uintptr_t free=0;if(__atomic_compare_exchange_n(&ot2_threads[index].host_tp,&free,UINTPTR_MAX,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){c=&ot2_threads[index];break;}}
     if(!c)ot2_host_die("Guest live thread capacity exhausted");
+    // Remember the OS thread behind this context: a guest thread that spins
+    // without logging can only be sampled if the watchdog knows where to send
+    // its signal, and GuestThread's 64-byte layout is fixed by the ARM64
+    // bridges, so the mapping lives beside it.
+    ot2_guest_tids[index]=static_cast<int32_t>(syscall(SYS_gettid));
     auto* owned=new Owned{c};owned->tls=allocate(owned->tls_size,PROT_READ|PROT_WRITE);
     c->guest_tls=reinterpret_cast<uintptr_t>(owned->tls);c->guest_tlr=c->guest_tls+8192;
     *reinterpret_cast<uintptr_t*>(c->guest_tlr+0x1f8)=c->guest_tlr+0x200;
@@ -81,6 +94,20 @@ void ot2_guest_context_callback_stack(GuestThread* c,uintptr_t& base,size_t& siz
         if(mprotect(static_cast<uint8_t*>(owned->callback)+page,size,PROT_READ|PROT_WRITE))ot2_host_die("Callback stack protection failed");
     }
     base=uintptr_t(owned->callback)+page;
+}
+void ot2_guest_context_worker_stack(GuestThread* c,uintptr_t& base,size_t& size){
+    auto* owned=static_cast<Owned*>(pthread_getspecific(key));if(!owned||owned->context!=c)ot2_host_die("Worker stack on wrong thread");
+    // The SDK hands its workers a stack carved out of guest memory, and a title
+    // that sized it for the console can overflow it here once a host-side call
+    // chain is deeper. Give the worker a page-guarded stack of our own instead:
+    // the guest only ever uses the stack pointer, never the address, so where it
+    // lives is not observable to it.
+    const size_t page=sysconf(_SC_PAGESIZE);size=1024*1024;
+    if(!owned->worker){
+        owned->worker_size=size+2*page;owned->worker=allocate(owned->worker_size,PROT_NONE);
+        if(mprotect(static_cast<uint8_t*>(owned->worker)+page,size,PROT_READ|PROT_WRITE))ot2_host_die("Worker stack protection failed");
+    }
+    base=uintptr_t(owned->worker)+page;
 }
 size_t ot2_guest_context_live(){return live.load();}
 size_t ot2_guest_context_bytes(){return mapped_bytes.load();}

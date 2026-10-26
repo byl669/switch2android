@@ -1,5 +1,6 @@
 #include "../input.h"
 #include "backend.h"
+#include "traced_mutex.h"
 #include "nvn_commands.h"
 #include "nvn_program.h"
 #include "shader_reflection.h"
@@ -113,14 +114,23 @@ TextureDescriptor* texture_descriptor(unsigned id){
     if(cache_texture_lookups)slot={active_texture_pool,id,&it->second};return &it->second;
 }
 uintptr_t descriptor_pool_key(const dpool_t* p){if(!p || !p->pool || !p->pool->mem)ot2_host_die("Invalid descriptor pool");return uintptr_t(p->pool->mem)+p->off;}
-std::mutex state_mutex;std::condition_variable surface_changed;
+ot2::TracedMutex state_mutex{"state"};std::condition_variable surface_changed;
 std::string shader_directory;
 std::string shader_binary_directory;
 VkShaderModule shared_shader_module(const uint32_t*,size_t);
 void start_pipeline_warmup();
 bool complete_shader_cache=false;
 bool capture_frame=false;
-uint64_t capture_frame_number=5,capture_bytes=0;
+uint64_t capture_frame_number=300,capture_bytes=0;
+// The frame a capture is taken from is what makes two runs comparable: the same
+// frame twice shows whether a scene is animating, two different frames show
+// whether it ever changes. Reading it from a file keeps that reachable without
+// a rebuild.
+void read_capture_frame_number() {
+    std::ifstream in(shader_directory+"/capture-frame-number");
+    unsigned long long value=0;
+    if(in>>value && value) capture_frame_number=value;
+}
 bool trace_draw_completion=false;
 VkCommandPool command_pool;
 VkPipelineCache pipeline_cache;
@@ -153,6 +163,20 @@ bool merge_enabled=true;bool batch_enabled=true;bool batching=false;VkCommandBuf
 bool readonly_stores_enabled=false;
 bool precise_barriers=true,clear_planning=true,prune_unused_depth=true;
 uint64_t scoped_barriers=0,folded_clears=0,elided_clears=0,pruned_depth=0,empty_draws=0;
+// Draws skipped because a shader stage has no translation in the offline cache.
+// Counted, not fatal: see shader_for in draw.inc.
+uint64_t skipped_missing_draws=0;
+// Draws that reached the pipeline with a shader input the title never bound. The
+// console supplies a disabled attribute; Vulkan leaves it undefined.
+std::atomic<uint64_t> unbound_attribute_draws{0};
+// Draws that reached vkCmdDraw / vkCmdDrawIndexed, with the geometry volume they
+// described. Zero here with a blank screen means the filter chain, not the GPU.
+std::atomic<uint64_t> draws_submitted{0},indices_submitted{0},vertices_submitted{0};
+// Conditional-render tallies. "Undecided" means the two sampled counters were both
+// still zero, so the comparison could not be trusted and the draw went ahead;
+// "skipped" means a decided answer said no. A large undecided count against a small
+// decided one means the title's occlusion queries are not being answered at all.
+uint64_t undecided_conditional_draws=0,decided_conditional_draws=0,skipped_conditional_draws=0;
 void materialize_clears(uint64_t serial=0);
 bool consume_clear(const tex_t&,const view_t*,VkExtent2D,uint32_t,VkImageAspectFlags,VkRenderingAttachmentInfo&);
 struct AttachmentStores {uint64_t none[3]{},promotions{},fallbacks{};} attachment_stores;
@@ -205,11 +229,38 @@ uint64_t image_identity(uint64_t serial){auto* image=find_image(serial);return i
 SerialQueue& translation_queue(){static auto* queue=new SerialQueue;return *queue;}
 SerialQueue& presentation_queue(){static auto* queue=new SerialQueue(3);return *queue;}
 SerialQueue& completion_queue(){static auto* queue=new SerialQueue;return *queue;}
-CompletionTimeline gpu_completion;
+CompletionTimeline gpu_completion{"gpu_completion"};
 constexpr uint64_t present_ticket_bit=uint64_t(1)<<63;
 std::atomic<bool> presentation_suspended{false};
 std::mutex presentation_wait_mutex;std::condition_variable presentation_changed;
 bool verbose_gpu_logs=false,polling_pacer=false;
+// Diagnostic switch: swap the title's unit quad for a screen-sized one on 2D
+// sprite programs, so the geometry question and the shading question can be
+// answered separately. See draw.inc.
+bool sprite_pixels_forced=false;
+float sprite_pixel_scale=1.0f;
+float sprite_instance_scale=1.0f;
+float sprite_rect_w=640.f,sprite_rect_h=360.f;
+float sprite_scale_probe=0.0f;
+bool paint_draws_probe=false;
+bool ui_matrix_probe=false;
+// Whether the bytes past a bound uniform range are read from the title's memory
+// or filled with zero. The console behaviour is to read them: one physical driver
+// segment per slot, and titles do write past what they bind -- the bank at 912
+// bytes has a rotation and translation starting at exactly 912. Reads are capped
+// at the end of the page the range starts in, so this can never cross into
+// memory the title has not mapped.
+bool uniform_tail_from_memory=true;
+// Diagnostic: log every uniform range the title binds and every byte range it
+// writes into them. See the OP_BIND_UBO case.
+bool trace_uniform_banks=false;
+// Diagnostic: dump the constant banks a 2D sprite draw reads, including the bytes
+// past each bank's declared size. See the bank dump in the OP_TRACE block.
+bool bank_dump_probe=false;
+// Per-draw counters cannot tell "the composite of the scene target is missing"
+// apart from "the frame really is empty". One traced frame can: it shows every
+// target switch, clear, copy and draw in the order the title issued them.
+uint64_t trace_ops_frame=0,trace_op_index=0;uint32_t trace_op_hist[64]{};
 bool prepare_before_pace=false;
 bool present_before_pace=false;
 uint64_t present_prepare_ns=0,present_late_ns=0,present_late_max_ns=0;
@@ -228,14 +279,40 @@ struct RenderState {
     float viewport[6]{0,0,1280,720,0,1};p_scissor scissor{0,0,1280,720};
     p_depth_bounds depth_bounds{0,0,1};
     uint32_t sample_mask=~0u,raster_discard=0,depth_clamp=0,render_enable=1;float line_width=1;
+    // Conditional render state: mode 0 renders when the two sampled counters are
+    // equal, mode 1 when they differ. render_cond_active is cleared by a plain
+    // SetRenderEnable, which replaces the condition with an unconditional answer.
+    int32_t render_cond_mode=-1;uint64_t render_cond_addr=0;
     p_poly_offset depth_bias{};float blend_color[4]{};
     uint32_t stencil_reference[2]{},stencil_compare_mask[2]{255,255},stencil_write_mask[2]{255,255};
 } render_state;
 std::shared_ptr<const NvnProgramVersion> bound_programs[6];
 int64_t copy_row_stride=0,copy_image_stride=0;
 float timestamp_period=1;
+// Key of a stage as the offline cache names it: the control section at its own
+// length followed by the code area. The control section alone is not enough for
+// this title -- 613 of its 2125 shaders share a control section and differ only
+// in code (the Bezel Engine compiles one control per program family, one code
+// area per variant) -- so a control-only key answers every variant with the one
+// shader that happened to be translated first. nxnative's host (prog_get) and
+// its shader_split.py both key these two pieces together.
+std::string shader_key(const void* control,const void* code,size_t code_size) {
+    uint64_t hash=14695981039346656037ULL;
+    const auto* p=static_cast<const uint8_t*>(control);
+    uint32_t n=0x880;
+    if(p){uint32_t own=0;memcpy(&own,p+0x20,4);if(own>=0x760&&own<0x880)n=own;
+        for(uint32_t j=0;j<n;j++)hash=(hash^p[j])*1099511628211ULL;}
+    const auto* c=static_cast<const uint8_t*>(code);
+    for(size_t j=0;c&&j<code_size;j++)hash=(hash^c[j])*1099511628211ULL;
+    char key[32];snprintf(key,sizeof(key),"%016llx",(unsigned long long)hash);return key;
+}
+// The control section alone, exactly as the first revision of this host hashed
+// it (a fixed 0x880, no own-length adjustment). It stays byte-for-byte as it was
+// because it is the name the shipped cache is filed under: the fallback in
+// shader_for must be able to reproduce those names precisely.
 std::string shader_key(const void* control) {
-    uint64_t hash=14695981039346656037ULL;auto* p=static_cast<const uint8_t*>(control);for(unsigned j=0;j<0x880;j++)hash=(hash^p[j])*1099511628211ULL;
+    uint64_t hash=14695981039346656037ULL;const auto* p=static_cast<const uint8_t*>(control);
+    for(uint32_t j=0;p&&j<0x880;j++)hash=(hash^p[j])*1099511628211ULL;
     char key[32];snprintf(key,sizeof(key),"%016llx",(unsigned long long)hash);return key;
 }
 uint64_t monotonic_ns(){timespec t{};clock_gettime(CLOCK_MONOTONIC,&t);return uint64_t(t.tv_sec)*1000000000+t.tv_nsec;}
@@ -243,6 +320,23 @@ struct Perf {uint64_t passes{},submits{},wait_ns{},draw_ns{},buffer_ns{},buffer_
 // Per-draw clocks are diagnostic work; HUD timing comes from display timestamps.
 // Keep the coarse replay timer for low-cost frame comparisons.
 bool detail_timing=false,stats_enabled=false;
+// Draws every pass opaque, ignoring the title's blend state. A diagnostic for the
+// case where the frame presents steadily and geometry is submitted but no pixel
+// ever changes: it separates "blending hides it" from "nothing writes here".
+bool opaque_blend_forced=false;
+// Two independent switches for the winding question (see the rasterisation state
+// in draw.inc). `no-cull` forces culling off, which tells a mis-set winding apart
+// from a draw that never reaches the rasteriser at all. `keep-winding` restores
+// the pre-fix mapping (front-face value passed through unchanged) so the two can
+// be compared in one session.
+bool cull_none_forced=false;
+bool winding_not_flipped=false;
+// Diagnostic: drop the depth attachment from every rendering instance. A 2D pass
+// that binds a depth image of a different size than its colour target leaves the
+// rendering area outside the depth image, which Vulkan does not define; the draw
+// then writes nothing and reports no error. Unbinding the depth says whether that
+// mismatch is what keeps such a pass off the screen.
+bool force_no_depth=false;
 void stats_log(const char* format,...) {
     if(!stats_enabled)return;
     char text[2048];va_list args;va_start(args,format);vsnprintf(text,sizeof(text),format,args);va_end(args);
@@ -309,7 +403,13 @@ VkFormat format(int f) {
         F(RGBA32F,R32G32B32A32_SFLOAT);F(RGBA32UI,R32G32B32A32_UINT);F(RGBA32I,R32G32B32A32_SINT);
         F(BGRA8,B8G8R8A8_UNORM);F(BGRX8,B8G8R8A8_UNORM);F(BGRA8_SRGB,B8G8R8A8_SRGB);F(BGRX8_SRGB,B8G8R8A8_SRGB);
         F(RGBA8_SRGB,R8G8B8A8_SRGB);F(RGBX8,R8G8B8A8_UNORM);F(RGBX8_SRGB,R8G8B8A8_SRGB);
-        F(DEPTH16,D16_UNORM);F(DEPTH24,X8_D24_UNORM_PACK32);F(DEPTH32F,D32_SFLOAT);F(DEPTH24_STENCIL8,D24_UNORM_S8_UINT);F(DEPTH32F_STENCIL8,D32_SFLOAT_S8_UINT);
+        // DEPTH24 is X8_D24_UNORM_PACK32, which Adreno drivers do not offer as a
+        // depth attachment (no VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT).
+        // The format is then still created and still bound, and the rendering
+        // instance that uses it produces nothing at all -- every draw is dropped
+        // without an error. D32_SFLOAT carries the same "depth only, no stencil"
+        // meaning with full driver support, and a wider depth is never worse.
+        F(DEPTH16,D16_UNORM);F(DEPTH24,D32_SFLOAT);F(DEPTH32F,D32_SFLOAT);F(DEPTH24_STENCIL8,D24_UNORM_S8_UINT);F(DEPTH32F_STENCIL8,D32_SFLOAT_S8_UINT);
         F(R11G11B10F,B10G11R11_UFLOAT_PACK32);F(RGB10A2,A2B10G10R10_UNORM_PACK32);F(RGB10A2UI,A2B10G10R10_UINT_PACK32);
         F(RGB_DXT1,BC1_RGB_UNORM_BLOCK);F(RGBA_DXT1,BC1_RGBA_UNORM_BLOCK);F(RGBA_DXT3,BC2_UNORM_BLOCK);F(RGBA_DXT5,BC3_UNORM_BLOCK);
         F(RGB_DXT1_SRGB,BC1_RGB_SRGB_BLOCK);F(RGBA_DXT1_SRGB,BC1_RGBA_SRGB_BLOCK);F(RGBA_DXT3_SRGB,BC2_SRGB_BLOCK);F(RGBA_DXT5_SRGB,BC3_SRGB_BLOCK);
@@ -540,6 +640,15 @@ bool consume_clear(const tex_t& texture,const view_t* view,VkExtent2D extent,uin
 void clear_texture(const p_clear_tex& clear) {
     auto& image=image_for(*clear.tex);
     if(image.bc)ot2_host_die("Compressed textures cannot be cleared as render targets");
+    // Texture clears bypass the render-target clear path entirely, so a frame
+    // whose backdrop comes from one shows no CLEAR_COLOR at all and looks like
+    // it was painted by a draw. Record which of the two actually happened.
+    static std::atomic<uint64_t> clear_tex_probe{0};
+    if(clear_tex_probe.fetch_add(1,std::memory_order_relaxed)%32==0)
+        ot2_host_log("CLEAR_TEX serial=%llu %ux%u fmt=%u c=%.4g,%.4g,%.4g,%.4g mask=%#x region=%d,%d,%dx%d uint=%d",
+            (unsigned long long)clear.tex->serial,clear.tex->d.width,clear.tex->d.height,clear.tex->d.format,
+            clear.c.f[0],clear.c.f[1],clear.c.f[2],clear.c.f[3],clear.mask,
+            clear.r.xoffset,clear.r.yoffset,clear.r.width,clear.r.height,int(clear.is_uint));
     if(!(clear.mask&15))return;
     auto range=subresources(image,clear.has_view?&clear.view:nullptr);
     const auto w=std::max(1U,clear.tex->d.width>>range.baseMipLevel),h=std::max(1U,clear.tex->d.height>>range.baseMipLevel);
@@ -554,6 +663,16 @@ void clear_texture(const p_clear_tex& clear) {
 void clear_color(const p_clear_color& clear) {
     if(clear.index<0 || clear.index>=render_targets.n || !render_targets.color[clear.index])return;
     const auto* texture=render_targets.color[clear.index];const auto& view=render_targets.cview[clear.index];
+    // Which value ends up as a frame's backdrop is the single question that
+    // separates "the game asked for this colour" from "a draw painted it", and
+    // the clear colour was invisible in the logs -- so a grey frame could only
+    // be argued about, never read off.
+    static std::atomic<uint64_t> clear_probe{0};
+    if(clear_probe.fetch_add(1,std::memory_order_relaxed)%64==0)
+        ot2_host_log("CLEAR_COLOR serial=%llu %ux%u fmt=%u rgba=%.4g,%.4g,%.4g,%.4g mask=%#x scissor=%d,%d,%dx%d uint=%d",
+            (unsigned long long)texture->serial,texture->d.width,texture->d.height,texture->d.format,
+            clear.rgba[0],clear.rgba[1],clear.rgba[2],clear.rgba[3],clear.mask,
+            render_state.scissor.x,render_state.scissor.y,render_state.scissor.w,render_state.scissor.h,int(clear.is_uint));
     p_clear_tex c{};c.tex=texture;c.has_view=render_targets.has_cview[clear.index];c.view=view;c.mask=clear.mask;
     auto level=c.has_view && view.set_levels?view.base_level:0;c.r.width=std::max(1U,texture->d.width>>level);c.r.height=std::max(1U,texture->d.height>>level);c.r.depth=1;
     c.is_uint=clear.is_uint;auto& sc=render_state.scissor;
@@ -579,6 +698,7 @@ void clear_depth(const p_clear_ds& clear) {
 }
 void capture_draw(uint32_t operation,const uint8_t* parameters);
 void diagnostic_draw(uint64_t draw,uint32_t operation,const uint8_t* parameters);
+static void probe_pixels(const tex_t& texture,uint64_t index,unsigned op);
 #include "draw.inc"
 #include "cache_maintenance.inc"
 #include "gpu_completion.inc"
@@ -588,7 +708,14 @@ void diagnostic_draw(uint64_t draw,uint32_t operation,const uint8_t* parameters)
 void capture_draw(uint32_t operation,const uint8_t* parameters) {
     using nlohmann::json;json record;record["operation"]=operation;record["programs"]=json::array();record["targets"]=json::array();record["attributes"]=json::array();
     for(int stage=0;stage<6;stage++)if(auto* p=render_state.programs[stage])for(unsigned i=0;i<p->nstage;i++) {
-        auto key=shader_key(p->sd[i].control);record["programs"].push_back({{"stage",stage},{"key",key}});ot2_host_log("DRAW_SHADER stage=%d key=%s",stage,key.c_str());
+        // The cache is filed under control section plus code area, so the record
+        // has to be named the same way; a control-only key would name a sibling
+        // shader (this title has 613 of them).
+        uint32_t code_size=0;
+        if(p->sd[i].control)memcpy(&code_size,reinterpret_cast<const uint8_t*>(p->sd[i].control)+0x704,4);
+        const auto key=shader_key(reinterpret_cast<const void*>(p->sd[i].control),
+                                  reinterpret_cast<const void*>(p->sd[i].data),code_size);
+        record["programs"].push_back({{"stage",stage},{"key",key}});ot2_host_log("DRAW_SHADER stage=%d key=%s",stage,key.c_str());
     }
     for(int i=0;i<render_targets.n;i++)if(auto* t=render_targets.color[i])record["targets"].push_back({{"width",t->d.width},{"height",t->d.height},{"format",t->d.format},{"serial",t->serial}});
     for(int i=0;i<16;i++){const auto& a=render_state.attributes[i];if(a.fmt)record["attributes"].push_back({{"location",i},{"format",uint32_t(a.fmt)},{"offset",uint32_t(a.offset)},{"stream",uint32_t(a.stream)},{"stride",render_state.streams[a.stream].stride}});}
@@ -647,7 +774,6 @@ void diagnostic_draw(uint64_t draw,uint32_t operation,const uint8_t* parameters)
         const std::string dir=shader_directory+"/frame"+std::to_string(capture_frame_number);std::filesystem::create_directories(dir);
         Json record={{"draw",draw},{"shaders",Json::array()},{"targets",Json::array()}};std::string fragment;
         for(int stage=0;stage<5;stage++)if(render_state.programs[stage]){auto key=shader_key(stage_data(stage).control);record["shaders"].push_back({{"stage",stage},{"key",key}});if(stage==1)fragment=key;}
-        for(int i=0;i<render_targets.n;i++)if(auto* tex=render_targets.color[i]){auto* v=render_targets.has_cview[i]?&render_targets.cview[i]:nullptr;record["targets"].push_back({{"index",i},{"serial",tex->serial},{"backing",uintptr_t(tex->mem)},{"format",tex->d.format},{"view_format",v&&v->set_format?v->format:tex->d.format},{"width",tex->d.width},{"height",tex->d.height}});if(tex->d.format==NVN_FORMAT_R11G11B10F)target=i;}
         std::ofstream(dir+"/draws.jsonl",std::ios::app)<<record.dump()<<'\n';
         if(render_targets.n>1){if(captured.contains(fragment)||(selected.empty()?captured.size()>=8:!selected.contains(fragment)))return;captured.insert(fragment);}
     }
@@ -658,7 +784,15 @@ void diagnostic_draw(uint64_t draw,uint32_t operation,const uint8_t* parameters)
     unsigned z=img.is_3d?std::max(1U,t->d.depth>>level):1;
     int bw,bh,bytes=nvn_fmt_bpb(t->d.format,&bw,&bh);if(bw!=1 || bh!=1 || size_t(w)*h*z*bytes>16*1024*1024)return;
     const size_t capture_size=size_t(w)*h*z*bytes;if(capture_bytes+capture_size>512*1024*1024)return;capture_bytes+=capture_size;
-    auto b=make_buffer(nullptr,capture_size,VK_BUFFER_USAGE_TRANSFER_DST_BIT);VkBufferImageCopy c{};c.bufferOffset=b.offset;c.imageSubresource={img.aspects,level,uint32_t(!img.is_3d&&view&&view->set_layers?view->min_layer:0),1};c.imageExtent={w,h,z};auto cmd=begin_commands();barrier(cmd,img,img.layout,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);vkCmdCopyImageToBuffer(cmd,img.image,img.layout,b.buffer,1,&c);finish_commands(cmd);flush_commands();
+    auto b=make_buffer(nullptr,capture_size,VK_BUFFER_USAGE_TRANSFER_DST_BIT);VkBufferImageCopy c{};c.bufferOffset=b.offset;c.imageSubresource={img.aspects,level,uint32_t(!img.is_3d&&view&&view->set_layers?view->min_layer:0),1};c.imageExtent={w,h,z};
+    // Everything recorded so far has to reach the GPU before this image can be
+    // copied: under batching the draws above are only recorded, and the image is
+    // still a live render attachment. Transitioning an attachment mid-pass and
+    // copying it is not legal, and the copy then returns whatever the image held
+    // before -- which is why every captured scene target read back as the clear
+    // colour and was mistaken for "the draw produced nothing".
+    flush_commands();
+    auto cmd=begin_commands();barrier(cmd,img,img.layout,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);vkCmdCopyImageToBuffer(cmd,img.image,img.layout,b.buffer,1,&c);finish_commands(cmd);flush_commands();
     std::string dir=shader_directory+"/frame"+std::to_string(capture_frame_number);std::filesystem::create_directories(dir);auto path=dir+"/"+std::to_string(draw);
     std::ofstream(path+".raw",std::ios::binary).write(static_cast<const char*>(b.mapped),size_t(w)*h*z*bytes);destroy_buffer(b);
     Json meta={{"draw",draw},{"width",w},{"height",h},{"depth",z},{"format",t->d.format},{"serial",t->serial},{"shaders",Json::array()},{"textures",Json::array()}};
@@ -681,6 +815,13 @@ void diagnostic_draw(uint64_t draw,uint32_t operation,const uint8_t* parameters)
 
     if(render_targets.depth)meta["depth_attachment"]={{"serial",render_targets.depth->serial},{"backing",uintptr_t(render_targets.depth->mem)},{"format",render_targets.depth->d.format}};
     meta["viewport"]=render_state.viewport;meta["scissor"]={render_state.scissor.x,render_state.scissor.y,render_state.scissor.w,render_state.scissor.h};
+    // The colour write mask decides whether a draw's fragment output reaches the
+    // target at all, and it was missing from the record -- so an emulated prepass
+    // that left it at zero looked identical to a draw that produced nothing.
+    meta["channel_mask"]=render_state.channel_mask.mask;
+    meta["depth_test"]=uint32_t(render_state.depth_stencil.dt);
+    meta["depth_write"]=uint32_t(render_state.depth_stencil.dw);
+    meta["depth_func"]=uint32_t(render_state.depth_stencil.df);
     auto& poly=render_state.polygon;auto& ds=render_state.depth_stencil;auto& db=render_state.depth_bounds;auto& bl=render_state.blends[0];
     meta["raster"]={{"cull",uint32_t(poly.cull)},{"front",uint32_t(poly.front)},{"depth_test",uint32_t(ds.dt)},{"depth_write",uint32_t(ds.dw)},{"depth_func",uint32_t(ds.df)},{"stencil",uint32_t(ds.st)},{"bounds",{db.enable,db.minimum,db.maximum}},{"blend_enable",uint32_t(render_state.color.blend_en)},{"blend",{uint32_t(bl.src_rgb),uint32_t(bl.dst_rgb),uint32_t(bl.eq_rgb)}}};
     if(operation==OP_DRAW){auto& d=*reinterpret_cast<const p_draw*>(parameters);meta["draw_args"]={d.prim,d.first,d.count,d.instances,d.base_instance};}
@@ -723,6 +864,50 @@ void copy_texture(const p_copy_t2t& c) {
     finish_commands(cmd);dst.drawn=src.drawn;
 }
 
+// A draw whose state is legal and whose program compiled can still write no
+// pixel. Reading back a few texels after each command of one traced frame
+// separates "this command painted" from "this command did nothing", which no
+// amount of state inspection can decide.
+static void probe_pixels(const tex_t& texture,uint64_t index,unsigned op) {
+    auto& img=image_for(texture);
+    if(img.aspects!=VK_IMAGE_ASPECT_COLOR_BIT)return;
+    int bw,bh,bytes=nvn_fmt_bpb(texture.d.format,&bw,&bh);
+    const unsigned w=texture.d.width,h=texture.d.height;
+    if(bw!=1||bh!=1||w<16||h<16)return;
+    // Four points in the top-left eighth cannot tell "wrote nothing" apart from
+    // "wrote somewhere else". A coarse 8x6 grid over the whole target can: the
+    // map spells out where the content landed, and the legend names the colour.
+    constexpr int gx=8,gy=6;constexpr int n=gx*gy;
+    auto buffer=make_buffer(nullptr,size_t(n)*bytes,VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    flush_commands();
+    auto cmd=begin_commands();barrier(cmd,img,img.layout,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    for(int i=0;i<n;i++){
+        const unsigned sx=std::min(w-1,unsigned((size_t(w)*(i%gx*2+1))/(2*gx)));
+        const unsigned sy=std::min(h-1,unsigned((size_t(h)*(i/gx*2+1))/(2*gy)));
+        VkBufferImageCopy copy{};copy.bufferOffset=buffer.offset+size_t(i)*bytes;
+        copy.imageSubresource={img.aspects,0,0,1};
+        copy.imageOffset={int(sx),int(sy),0};copy.imageExtent={1,1,1};
+        vkCmdCopyImageToBuffer(cmd,img.image,img.layout,buffer.buffer,1,&copy);
+    }
+    finish_commands(cmd);flush_commands();
+    const auto* p=static_cast<const uint8_t*>(buffer.mapped);
+    unsigned legend[16]{};int used=0;char rows[gy][gx+1];memset(rows,0,sizeof rows);
+    for(int i=0;i<n;i++){
+        unsigned c=0;for(int b=0;b<bytes && b<3;b++)c|=unsigned(p[i*bytes+b])<<(8*b);
+        int slot=-1;for(int k=0;k<used;k++)if(legend[k]==c){slot=k;break;}
+        if(slot<0){if(used<15){legend[used]=c;slot=used++;}else slot=15;}
+        rows[i/gx][i%gx]=char('0'+slot);
+    }
+    char map[gy*(gx+1)+1]={0};size_t o=0;
+    for(int y=0;y<gy;y++){if(y)map[o++]='/';memcpy(map+o,rows[y],gx);o+=gx;}
+    char leg[16*9+1]={0};size_t lo=0;
+    for(int k=0;k<used;k++)lo+=size_t(snprintf(leg+lo,sizeof leg-lo,"%d=%06x ",k,legend[k]));
+    ot2_host_log("PIXMAP n=%llu op=%u rt=%llu %ux%u %s",(unsigned long long)index,op,
+        (unsigned long long)texture.serial,w,h,map);
+    ot2_host_log("PIXMAP legend %s",leg);
+    destroy_buffer(buffer);
+}
+
 void replay(const uint8_t* command,unsigned depth) {
     if(depth>32)ot2_host_die("Command call depth exceeded");
     for(unsigned count=0;count<1000000;count++) {
@@ -750,7 +935,8 @@ void replay(const uint8_t* command,unsigned depth) {
         case OP_JUMP:command=*reinterpret_cast<const uint8_t*const*>(p);continue;
         case OP_CALL:replay(*reinterpret_cast<const uint8_t*const*>(p),depth+1);break;
         case OP_BEGIN:break;
-        case OP_SET_TEX_POOL:{auto* pool=reinterpret_cast<const p_set_pool*>(p)->pool;auto key=descriptor_pool_key(pool);auto capacity=uint32_t(std::max(0,pool->n));if(active_texture_pool!=key||active_texture_capacity!=capacity)reset_prepared_bindings();active_texture_pool=key;active_texture_capacity=capacity;break;}
+        case OP_SET_TEX_POOL:{auto* pool=reinterpret_cast<const p_set_pool*>(p)->pool;auto key=descriptor_pool_key(pool);auto capacity=uint32_t(std::max(0,pool->n));
+            if(active_texture_pool!=key||active_texture_capacity!=capacity)reset_prepared_bindings();active_texture_pool=key;active_texture_capacity=capacity;break;}
         case OP_SET_SAMP_POOL:{auto* pool=reinterpret_cast<const p_set_pool*>(p)->pool;auto key=descriptor_pool_key(pool);auto capacity=uint32_t(std::max(0,pool->n));if(active_sampler_pool!=key||active_sampler_capacity!=capacity)reset_prepared_bindings();active_sampler_pool=key;active_sampler_capacity=capacity;break;}
         case OP_BARRIER:{if(batch_command){auto cmd=begin_commands();finish_commands(cmd);}break;}
         case OP_RESET_COUNTER:{auto type=*reinterpret_cast<const uint64_t*>(p);if(type!=NVN_COUNTER_TYPE_SAMPLES_PASSED)ot2_host_die("Counter reset type pending: %llu",(unsigned long long)type);if(!batch_query_resets)flush_commands();sample_intervals.push_back({counter_epoch,sample_reset_index,pending_queries});counter_epoch=std::make_shared<CounterEpoch>();sample_reset_index=pending_queries;samples_active=true;break;}
@@ -766,7 +952,12 @@ void replay(const uint8_t* command,unsigned depth) {
         // for unrelated draws which still own their previous bytes.
         case OP_COPY_B2B:{readonly_snapshots.clear();const auto* v=reinterpret_cast<const uint64_t*>(p);ensure_cpu_buffer(v[0],v[2]);ensure_cpu_buffer(v[1],v[2]);memmove(reinterpret_cast<void*>(v[1]),reinterpret_cast<const void*>(v[0]),v[2]);break;}
         case OP_CLEAR_BUFFER:{readonly_snapshots.clear();const auto* v=reinterpret_cast<const uint64_t*>(p);if((v[0]|v[1])&3)ot2_host_die("Unaligned buffer clear");ensure_cpu_buffer(v[0],v[1]);auto* out=reinterpret_cast<uint32_t*>(v[0]);std::fill_n(out,v[1]/4,uint32_t(v[2]));break;}
-        case OP_UPDATE_UB:{readonly_snapshots.clear();const auto* v=reinterpret_cast<const uint64_t*>(p);if(v[1]>h->size-24)ot2_host_die("Uniform command size invalid");ensure_cpu_buffer(v[0],v[1]);memcpy(reinterpret_cast<void*>(v[0]),p+16,v[1]);break;}
+        case OP_UPDATE_UB:{readonly_snapshots.clear();const auto* v=reinterpret_cast<const uint64_t*>(p);if(v[1]>h->size-24)ot2_host_die("Uniform command size invalid");
+            if(trace_uniform_banks){static std::atomic<uint64_t> seen{0};const uint64_t n=seen.fetch_add(1,std::memory_order_relaxed);
+                if(n<400)ot2_host_log("UPDATE_UB addr=%llx size=%llu first=%08x n=%llu",
+                    (unsigned long long)v[0],(unsigned long long)v[1],
+                    unsigned(p[24])|unsigned(p[25])<<8|unsigned(p[26])<<16|unsigned(p[27])<<24,(unsigned long long)n);}
+            ensure_cpu_buffer(v[0],v[1]);memcpy(reinterpret_cast<void*>(v[0]),p+16,v[1]);break;}
         case OP_FENCE:{break;} // Public completion is the enclosing submission's real GPU completion.
         case OP_WAIT_SYNC:{flush_commands();auto* f=*reinterpret_cast<const sync_t*const*>(p);auto ticket=__atomic_load_n(&f->fence,__ATOMIC_ACQUIRE);if(!__atomic_load_n(&f->fenced,__ATOMIC_ACQUIRE))ot2_host_die("Command wait on unsignaled sync");if(!(ticket&present_ticket_bit)&&ticket>replay_sequence)ot2_host_die("Command wait on future sync");break;}
         case OP_COPY_T2B:copy_from_texture(*reinterpret_cast<const p_copy_b2t*>(p),copy_row_stride,copy_image_stride);break;
@@ -780,26 +971,258 @@ void replay(const uint8_t* command,unsigned depth) {
         case OP_SAMPLE_MASK:update_pipeline_value(render_state.sample_mask,*reinterpret_cast<const uint32_t*>(p));break;
         case OP_RASTER_DISCARD:update_pipeline_value(render_state.raster_discard,*reinterpret_cast<const uint32_t*>(p));break;
         case OP_DEPTH_CLAMP:update_pipeline_value(render_state.depth_clamp,*reinterpret_cast<const uint32_t*>(p));break;
-        case OP_RENDER_ENABLE:render_state.render_enable=*reinterpret_cast<const uint32_t*>(p);break;
+        case OP_RENDER_ENABLE:
+            // An unconditional setting supersedes any pending condition, exactly as
+            // it would on the device: the last command recorded is the one in force.
+            render_state.render_enable=*reinterpret_cast<const uint32_t*>(p);
+            render_state.render_cond_mode=-1;break;
+        case OP_RENDER_COND:{auto* v=reinterpret_cast<const p_render_cond*>(p);
+            render_state.render_cond_mode=v->mode;render_state.render_cond_addr=v->addr;break;}
         case OP_LINE_WIDTH:update_pipeline_value(render_state.line_width,*reinterpret_cast<const float*>(p));break;
         case OP_DEPTH_RANGE:{auto* v=reinterpret_cast<const p_depth_range*>(p);render_state.viewport[4]=v->n;render_state.viewport[5]=v->f;break;}
-        case OP_BIND_PROGRAM:{auto* v=reinterpret_cast<const p_bind_program*>(p);for(int i=0;i<6;i++)if(v->stages&(1<<i)){
-            if(v->prog&&bound_programs[i]&&bound_programs[i]->value.serial==v->prog->serial)continue;
-            bound_programs[i]=v->prog?nvn_program_get(v->prog->serial):nullptr;render_state.programs[i]=v->prog?&bound_programs[i]->value:nullptr;
-            bound_shaders[i]=nullptr;++graphics_state_revision;++resource_generation;change_resource_groups(i,15);
-        }break;}
+        case OP_BIND_PROGRAM:{auto* v=reinterpret_cast<const p_bind_program*>(p);
+            // The stage argument is a mask, and titles commonly pass
+            // NVN_SHADER_STAGE_ALL_GRAPHICS_BITS (31) for a program that provides
+            // only a vertex and a fragment shader. That is legal: the mask says
+            // which stages this program is being assigned to, and a stage it has
+            // no shader for simply ends up empty. Binding the program there
+            // instead would leave a stage that reports itself absent at draw
+            // time, which drops the whole draw -- the symptom is an indexed draw
+            // being skipped on geometry while the program has only two stages.
+            for(int i=0;i<6;i++)if(v->stages&(1<<i)){
+                auto version=v->prog?nvn_program_get(v->prog->serial):std::shared_ptr<const NvnProgramVersion>();
+                const bool provided=version&&version->stages[i]>=0;
+                if(provided&&v->prog&&bound_programs[i]&&bound_programs[i]->value.serial==v->prog->serial)continue;
+                bound_programs[i]=provided?version:nullptr;
+                render_state.programs[i]=provided?&bound_programs[i]->value:nullptr;
+                bound_shaders[i]=nullptr;++graphics_state_revision;++resource_generation;change_resource_groups(i,15);
+            }break;}
         case OP_BIND_STATE:{auto* v=reinterpret_cast<const p_bind_state*>(p);auto* b=v->bytes;
             switch(v->kind){case 0:{auto& blend=*reinterpret_cast<const blend_st*>(b);update_pipeline_value(render_state.blends[blend.target],blend);break;}case 1:update_pipeline_bytes(&render_state.color,b,sizeof(color_st));break;case 2:update_pipeline_bytes(&render_state.channel_mask,b,sizeof(chmask_st));break;case 3:update_pipeline_bytes(&render_state.multisample,b,sizeof(ms_st));break;case 4:update_pipeline_bytes(&render_state.polygon,b,sizeof(poly_st));break;case 5:update_pipeline_bytes(&render_state.depth_stencil,b,sizeof(ds_st));break;default:ot2_host_die("Unknown pipeline state");}break;}
         case OP_BIND_VATTR:{auto* v=reinterpret_cast<const p_bind_vattr*>(p);update_pipeline_bytes(render_state.attributes+v->first,v->st,v->n*sizeof(va_st));break;}
         case OP_BIND_VSTREAM:{auto* v=reinterpret_cast<const p_bind_vstream*>(p);update_pipeline_bytes(render_state.streams+v->first,v->st,v->n*sizeof(vs_st));break;}
         case OP_BIND_VBUF:{auto* v=reinterpret_cast<const p_bind_vbuf*>(p);memcpy(render_state.vertex_buffers+v->first,v->r,v->n*sizeof(NVNbufferRange));break;}
-        case OP_BIND_UBO:case OP_BIND_SSBO:{auto* v=reinterpret_cast<const p_bind_buf*>(p);if(v->stage<0 || v->stage>=6 || v->index<0 || v->index>=16)ot2_host_die("Invalid buffer binding");auto& dst=(h->op==OP_BIND_UBO?render_state.uniforms:render_state.storage)[v->stage][v->index];if(update_binding_bytes(&dst,v,sizeof(*v))){change_resource_bank(v->stage,h->op==OP_BIND_UBO?3+v->index:0);if(h->op==OP_BIND_SSBO)++bank_generation[v->stage][0];}break;}
+        case OP_BIND_UBO:case OP_BIND_SSBO:{auto* v=reinterpret_cast<const p_bind_buf*>(p);if(v->stage<0 || v->stage>=6 || v->index<0 || v->index>=16)ot2_host_die("Invalid buffer binding");auto& dst=(h->op==OP_BIND_UBO?render_state.uniforms:render_state.storage)[v->stage][v->index];
+            // Every address the title binds for a slot, in order. A bank whose
+            // declared size never covers the shader's struct is either bound in
+            // pieces or read past its end, and those two need opposite fixes; the
+            // sequence of addresses tells which one this is.
+            if(trace_uniform_banks&&h->op==OP_BIND_UBO){
+                static std::atomic<uint64_t> seen{0};
+                const uint64_t n=seen.fetch_add(1,std::memory_order_relaxed);
+                if(n<400)ot2_host_log("BIND_UBO st=%d idx=%d addr=%llx size=%llu n=%llu",
+                    v->stage,v->index,(unsigned long long)v->addr,(unsigned long long)v->size,(unsigned long long)n);}
+            if(update_binding_bytes(&dst,v,sizeof(*v))){change_resource_bank(v->stage,h->op==OP_BIND_UBO?3+v->index:0);if(h->op==OP_BIND_SSBO)++bank_generation[v->stage][0];}break;}
         case OP_BIND_TEX:case OP_BIND_SAMP:case OP_BIND_IMG:{auto* v=reinterpret_cast<const p_bind_handles*>(p);if(v->stage<0 || v->stage>=6 || v->first<0 || v->n<0 || v->first+v->n>128)ot2_host_die("Invalid image binding");auto& handles=h->op==OP_BIND_TEX?render_state.texture_handles:h->op==OP_BIND_SAMP?render_state.sampler_handles:render_state.image_handles;if(update_binding_bytes(handles[v->stage]+v->first,v->h,v->n*8)){++bank_generation[v->stage][1];change_resource_bank(v->stage,2);}break;}
         case OP_POLY_OFFSET:update_pipeline_value(render_state.depth_bias,*reinterpret_cast<const p_poly_offset*>(p));break;
         case OP_BLEND_COLOR:update_pipeline_bytes(render_state.blend_color,p,16);break;
         case OP_STENCIL:{auto& v=*reinterpret_cast<const p_stencil*>(p);for(int i=0;i<2;i++)if(v.face==NVN_FACE_FRONT_AND_BACK || v.face==(i?NVN_FACE_BACK:NVN_FACE_FRONT)){if(v.which==0)update_pipeline_value(render_state.stencil_compare_mask[i],uint32_t(v.value_mask));else if(v.which==1)update_pipeline_value(render_state.stencil_write_mask[i],uint32_t(v.mask));else update_pipeline_value(render_state.stencil_reference[i],uint32_t(v.ref));}break;}
         case OP_DRAW:case OP_DRAW_IDX:case OP_DISPATCH:replay_next_command=command+h->size;execute_draw(h->op,p);replay_next_command=nullptr;break;
         default:ot2_host_die("Vulkan replay operation pending: %u",h->op);
+        }
+        if(trace_ops_frame&&presented_frames.load()+1==trace_ops_frame){
+            if(h->op<64)++trace_op_hist[h->op];
+            if(h->op==OP_SET_RT||h->op==OP_CLEAR_TEX||h->op==OP_CLEAR_COLOR||h->op==OP_COPY_T2T||
+               h->op==OP_DRAW||h->op==OP_DRAW_IDX||h->op==OP_DISPATCH||h->op==OP_END){
+                const unsigned long long target=render_targets.n&&render_targets.color[0]?render_targets.color[0]->serial:0;
+                if(h->op==OP_SET_RT){
+                    // The recorded payload, not the applied state: a draw with no
+                    // target can only be told apart from a state-tracking slip by
+                    // seeing what the title actually asked for on this command.
+                    const auto& rt=*reinterpret_cast<const p_set_rt*>(p);
+                    char names[160]={0};size_t used=0;
+                    for(int i=0;i<rt.n && i<8;++i)
+                        used+=size_t(snprintf(names+used,sizeof names-used," %llu%s",
+                            (unsigned long long)(rt.color[i]?rt.color[i]->serial:0),rt.has_cview[i]?"v":""));
+                    ot2_host_log("OP_TRACE n=%llu op=8 set_rt n=%d%s depth=%llu applied=%d",
+                        (unsigned long long)trace_op_index,rt.n,names,
+                        (unsigned long long)(rt.depth?rt.depth->serial:0),render_targets.n);
+                } else if(h->op==OP_COPY_T2T){
+                    const auto& copy=*reinterpret_cast<const p_copy_t2t*>(p);
+                    ot2_host_log("OP_TRACE n=%llu op=36 copy %llu(%ux%u f%u) -> %llu(%ux%u f%u) src=%d,%d,%dx%d dst=%d,%d,%dx%d flags=%#x",
+                        (unsigned long long)trace_op_index,
+                        (unsigned long long)copy.src->serial,copy.src->d.width,copy.src->d.height,copy.src->d.format,
+                        (unsigned long long)copy.dst->serial,copy.dst->d.width,copy.dst->d.height,copy.dst->d.format,
+                        copy.sr.xoffset,copy.sr.yoffset,copy.sr.width,copy.sr.height,
+                        copy.dr.xoffset,copy.dr.yoffset,copy.dr.width,copy.dr.height,unsigned(copy.flags));
+                } else if(h->op==OP_CLEAR_TEX){
+                    const auto& clear=*reinterpret_cast<const p_clear_tex*>(p);
+                    ot2_host_log("OP_TRACE n=%llu op=38 clear %llu %ux%u f%u c=%.3g,%.3g,%.3g,%.3g region=%d,%d,%dx%d",
+                        (unsigned long long)trace_op_index,(unsigned long long)clear.tex->serial,
+                        clear.tex->d.width,clear.tex->d.height,clear.tex->d.format,
+                        clear.c.f[0],clear.c.f[1],clear.c.f[2],clear.c.f[3],
+                        clear.r.xoffset,clear.r.yoffset,clear.r.width,clear.r.height);
+                } else if(h->op==OP_DRAW||h->op==OP_DRAW_IDX){
+                    // Fixed-function state that can silently void a draw: a stale
+                    // discard, a disabled render-enable, or a cull facing that empties
+                    // the triangle. Printed next to the counts so an empty frame can be
+                    // attributed without another run.
+                    const auto* d=reinterpret_cast<const int32_t*>(p);
+                    uint32_t declared=0;
+                    if(render_state.programs[0])for(auto loc:stage_shader(0).inputs)if(loc<16)declared|=1u<<loc;
+                    // Every attribute the title bound, plus which of them the vertex
+                    // shader actually declares. A location the shader reads but the
+                    // title never bound feeds undefined data; a location bound at an
+                    // offset the stream stride cannot reach reads the next vertex.
+                    char layout[320]={0};size_t used=0;
+                    for(int i=0;i<16;i++){const auto& a=render_state.attributes[i];if(a.fmt||(declared>>i&1)){
+                        used+=snprintf(layout+used,sizeof layout-used," %d%s:f%d(v%d)/o%d/s%d",i,
+                            (declared>>i&1)?"*":"",unsigned(a.fmt),a.fmt?int(unsigned(format(a.fmt))):-1,
+                            uint32_t(a.offset),uint32_t(a.stream));
+                        if(used>=sizeof layout-32)break;}}
+                    ot2_host_log("OP_TRACE n=%llu op=%u draw rt=%d/%llu vp=%dx%d prim=%d first=%d count=%d base=%d inst=%d discard=%u enable=%u cond=%d cull=%u front=%u mode=%u attr:%s",
+                        (unsigned long long)trace_op_index,h->op,render_targets.n,target,
+                        int(render_state.viewport[2]),int(render_state.viewport[3]),
+                        d[0],h->op==OP_DRAW_IDX?-1:d[1],d[2],d[3],h->op==OP_DRAW_IDX?d[5]:d[4],
+                        render_state.raster_discard,render_state.render_enable,render_state.render_cond_mode,
+                        unsigned(render_state.polygon.cull),unsigned(render_state.polygon.front),unsigned(render_state.polygon.mode),
+                        layout);
+                    // A stream whose stride is smaller than the furthest attribute
+                    // offset it serves makes every fetch read the neighbouring
+                    // vertex; the quad is then assembled from overlapping data and
+                    // collapses. Printed for every stream the attributes use.
+                    {char streams[192]={0};size_t at=0;
+                     for(int s=0;s<16&&at<sizeof streams-24;s++){const auto& st=render_state.streams[s];
+                        if(!st.stride&&!st.divisor)continue;
+                        at+=snprintf(streams+at,sizeof streams-at," s%d=%u/%u",s,unsigned(st.stride),unsigned(st.divisor));}
+                     ot2_host_log("OP_TRACE  streams:%s",streams);}
+                    // A 2D sprite program reads one vec4 of vertices and projects
+                    // them with a matrix. The bank it reads is the only place that
+                    // matrix can come from, and a bank declared shorter than the
+                    // shader's struct means either the data is there and unreachable
+                    // or it was never written. Dumping the raw range next to the
+                    // bank's own contents separates those two: numbers past the
+                    // declared size prove the title filled more than it bound.
+                    if(bank_dump_probe&&render_state.programs[0]&&stage_shader(0).inputs.size()<=1&&
+                       render_state.streams[0].stride==28){
+                        for(int bank=0;bank<16;bank++){
+                            const auto& u=render_state.uniforms[0][bank];
+                            if(!u.addr||!u.size)continue;
+                            char vals[512]={0};size_t at=0;
+                            const size_t count=std::min<size_t>(u.size/4,32);
+                            const float* f=reinterpret_cast<const float*>(u.addr);
+                            for(size_t k=0;k<count&&at<sizeof vals-16;k++)
+                                at+=size_t(snprintf(vals+at,sizeof vals-at,"%s%g",k?" ":"",f[k]));
+                            ot2_host_log("OP_TRACE  bank%d addr=%llx size=%zu %s",bank,
+                                (unsigned long long)u.addr,u.size,vals);
+                            // Same range continued past the declared size, read
+                            // straight from the title's memory.
+                            if(u.size<1024){
+                                char more[512]={0};size_t at2=0;
+                                const size_t extra=std::min<size_t>((1024-u.size)/4,32);
+                                for(size_t k=0;k<extra&&at2<sizeof more-16;k++)
+                                    at2+=size_t(snprintf(more+at2,sizeof more-at2,"%s%g",k?" ":"",f[count+k]));
+                                ot2_host_log("OP_TRACE   past+%zu %s",u.size,more);
+                            }
+                        }
+                    }
+                    // A draw that writes nothing is either never rasterised or
+                    // thrown away after shading. Blend enable with a zero source
+                    // alpha and a zero write mask look identical in the pixels.
+                    ot2_host_log("OP_TRACE  state blendEn=%u src=%u/%u dst=%u/%u eq=%u/%u cmask=%#x dt=%u dw=%u df=%u vpf=%.4g..%.4g sc=%d,%d,%dx%d",
+                        unsigned(render_state.color.blend_en),
+                        unsigned(render_state.blends[0].src_rgb),unsigned(render_state.blends[0].src_a),
+                        unsigned(render_state.blends[0].dst_rgb),unsigned(render_state.blends[0].dst_a),
+                        unsigned(render_state.blends[0].eq_rgb),unsigned(render_state.blends[0].eq_a),
+                        render_state.channel_mask.mask,
+                        unsigned(render_state.depth_stencil.dt),unsigned(render_state.depth_stencil.dw),unsigned(render_state.depth_stencil.df),
+                        double(render_state.viewport[4]),double(render_state.viewport[5]),
+                        render_state.scissor.x,render_state.scissor.y,render_state.scissor.w,render_state.scissor.h);
+                    // The composite passes carry no per-vertex transform: the quad
+                    // is a unit square and the constant bank places it. If that
+                    // bank is zero the quad has no extent and nothing is written,
+                    // which from the outside is indistinguishable from a bad shader.
+                    // Every bank has to be listed: the transform is not in the same
+                    // slot for the scene shader and the composite shader.
+                    if(render_state.programs[0]){
+                        auto& sh=stage_shader(0);                        char declared_list[96]={0};size_t dl=0;
+                        for(auto loc:sh.inputs)dl+=size_t(snprintf(declared_list+dl,sizeof declared_list-dl,"%s%u",dl?",":"",loc));
+                        ot2_host_log("OP_TRACE  vs-inputs=[%s] key=%s cbufs=%zu sbufs=%zu support=%d",declared_list,
+                            sh.resources->key.c_str(),sh.resources->cbufs.size(),sh.resources->sbufs.size(),
+                            sh.needs_support_buffer?1:0);
+                        // A sprite program places its quad from data, not from the
+                        // vertex buffer: either a constant bank or a storage buffer
+                        // whose address the title stores inside one. Both are printed
+                        // so an unbound or mis-resolved source shows up as a number
+                        // instead of as a silently blank frame.
+                        for(auto& sb:sh.resources->sbufs){auto b=storage_binding(0,sb,sh);
+                            ot2_host_log("OP_TRACE  sbuf binding=%u bank=%d word=%d addr=%llx size=%llu",
+                                sb.binding,sb.cb_slot,sb.cb_offset,(unsigned long long)b.address,(unsigned long long)b.size);
+                            // A batched sprite program keeps its per-instance rects
+                            // in this buffer, so its contents are the positions. A
+                            // rect of zero extent here means the draw is correct and
+                            // empty; a sensible rect means the positions are fine and
+                            // the vertex stage is what discards them.
+                            if(bank_dump_probe&&b.address&&b.size&&b.size<=4096){
+                                const auto* f=reinterpret_cast<const float*>(b.address);
+                                const size_t count=std::min<size_t>(b.size/4,64);
+                                char vals[512]={0};size_t at=0;
+                                for(size_t k=0;k<count&&at<sizeof vals-16;k++)
+                                    at+=size_t(snprintf(vals+at,sizeof vals-at,"%s%g",k?" ":"",f[k]));
+                                ot2_host_log("OP_TRACE   sbufdata %s",vals);}
+                        }
+                        int slot=0;
+                        for(auto& cb:sh.resources->cbufs){                            if(++slot>8)break;
+                            auto bank=constant_bank(0,cb.slot,sh);
+                            if(bank.size()<16){ot2_host_log("OP_TRACE  vs-c%d size=%zu (short)",cb.slot,bank.size());continue;}
+                            const float* f=reinterpret_cast<const float*>(bank.data());
+                            const size_t n=std::min<size_t>(bank.size()/4,192);
+                            std::string vals;vals.reserve(n*10);
+                            char one[32];
+                            for(size_t k=0;k<n;k++){snprintf(one,sizeof one,"%s%g",k?" ":"",f[k]);vals+=one;}
+                            ot2_host_log("OP_TRACE  vs-c%d size=%zu %s",cb.slot,bank.size(),vals.c_str());
+                        }
+                    }
+                    // A 2D sprite program places each sprite from a per-instance
+                    // rectangle rather than from the vertex buffer, so a rect of
+                    // zero width or height means the draw is correct and empty at
+                    // the same time. The instance records are read straight out of
+                    // the bound buffer: whatever is printed here is what the shader
+                    // multiplies its unit quad by.
+                    const uint32_t instances_seen=h->op==OP_DRAW_IDX?uint32_t(std::max(0,d[5])):uint32_t(std::max(0,d[4]));
+                    if(h->op==OP_DRAW_IDX&&instances_seen){
+                        const auto& a6=render_state.attributes[6];
+                        if(a6.fmt&&a6.stream<16){
+                            const auto& vb=render_state.vertex_buffers[a6.stream];const auto& st=render_state.streams[a6.stream];
+                            const uint32_t count=instances_seen<8?instances_seen:8;
+                            if(vb.address&&st.stride){char rects[320]={0};size_t at=0;
+                                for(uint32_t k=0;k<count&&at<sizeof rects-48;k++){
+                                    const uint64_t addr=uint64_t(vb.address)+uint64_t(k)*st.stride+a6.offset;
+                                    ensure_cpu_buffer(uintptr_t(addr),16);
+                                    const float* f=reinterpret_cast<const float*>(addr);
+                                    at+=size_t(snprintf(rects+at,sizeof rects-at," [%g %g %g %g]",f[0],f[1],f[2],f[3]));}
+                                ot2_host_log("OP_TRACE  rects s%d/%u stride=%u n=%u%s",uint32_t(a6.stream),uint32_t(a6.offset),
+                                    uint32_t(st.stride),uint32_t(instances_seen),rects);}
+                        }
+                    }
+                    for(int s=0;s<2;s++){const auto& vb=render_state.vertex_buffers[s];
+                        if(!vb.address||!vb.size)continue;
+                        const size_t n=size_t(std::min<uint64_t>(vb.size,64));ensure_cpu_buffer(uintptr_t(vb.address),n);
+                        const auto* bytes=reinterpret_cast<const uint8_t*>(vb.address);char hex[3*64+1]={0};
+                        for(size_t k=0;k<n;k++)snprintf(hex+k*3,4,"%02x ",bytes[k]);
+                        ot2_host_log("OP_TRACE  vbuf%d @%llx size=%llu %s",s,(unsigned long long)vb.address,(unsigned long long)vb.size,hex);}
+                    // Which images the fragment stage reads is what decides whether a
+                    // full-screen "present the scene" quad samples the scene at all.
+                    {char sources[128]={0};size_t at=0;
+                     for(int slot=0;slot<12&&at<sizeof sources-16;slot++){
+                        unsigned id=render_state.texture_handles[1][slot]&0xfffff;if(!id)continue;
+                        auto it=active_textures().find(id);if(it==active_textures().end())continue;
+                        at+=snprintf(sources+at,sizeof sources-at," %d:%llu/%ux%u",slot,
+                            (unsigned long long)it->second.texture.serial,it->second.texture.d.width,it->second.texture.d.height);}
+                     ot2_host_log("OP_TRACE  fs_textures:%s",sources[0]?sources:" none");}
+                    if(h->op==OP_DRAW_IDX){const auto& di=*reinterpret_cast<const p_draw_idx*>(p);
+                        if(di.ibuf){const size_t n=24;ensure_cpu_buffer(uintptr_t(di.ibuf),n);
+                            const auto* bytes=reinterpret_cast<const uint8_t*>(di.ibuf);char hex[3*24+1]={0};
+                            for(size_t k=0;k<n;k++)snprintf(hex+k*3,4,"%02x ",bytes[k]);
+                            ot2_host_log("OP_TRACE  ibuf @%llx itype=%d first_index_bytes=%s",(unsigned long long)di.ibuf,di.itype,hex);}}
+                } else
+                ot2_host_log("OP_TRACE n=%llu op=%u size=%u rt=%d/%llu vp=%dx%d",
+                    (unsigned long long)trace_op_index,h->op,h->size,render_targets.n,target,
+                    int(render_state.viewport[2]),int(render_state.viewport[3]));
+            }
+            ++trace_op_index;
+            if((h->op==OP_DRAW||h->op==OP_DRAW_IDX||h->op==OP_CLEAR_TEX||h->op==OP_COPY_T2T)&&
+               render_targets.n&&render_targets.color[0])probe_pixels(*render_targets.color[0],trace_op_index,h->op);
         }
         command+=h->size;
     }
@@ -831,7 +1254,9 @@ extern "C" void vkhost_configure_package(const char* path,const char* offline) {
     }
     readonly_stores_enabled=false;
     trace_draw_completion=std::filesystem::exists(shader_directory+"/trace-draw-completion");
-    capture_frame=std::filesystem::exists(shader_directory+"/capture-frame");if(capture_frame)std::filesystem::remove_all(shader_directory+"/frame5");
+    capture_frame=std::filesystem::exists(shader_directory+"/capture-frame");
+    if(capture_frame){read_capture_frame_number();std::filesystem::remove_all(shader_directory+"/frame"+std::to_string(capture_frame_number));
+        ot2_host_log("CAPTURE_FRAME armed for frame %llu",(unsigned long long)capture_frame_number);}
     if(device)start_pipeline_warmup();
 }
 extern "C" void vkhost_configure(const char* path){vkhost_configure_package(path,nullptr);}
@@ -840,15 +1265,79 @@ extern "C" void vkhost_program(const prog_t* program) {
     for(unsigned stage=0;stage<program->nstage;stage++) {
         const auto* control=static_cast<const uint8_t*>(program->sd[stage].control);
         const auto* code=reinterpret_cast<const uint8_t*>(program->sd[stage].data);
-        uint32_t magic=0,code_magic=0,size=0;memcpy(&magic,control,4);memcpy(&code_magic,code,4);memcpy(&size,control+0x704,4);
-        if(magic!=0x98761234 || size<8 || size>8*1024*1024)ot2_host_die("Unrecognized shader control: magic=%x code=%x size=%x",magic,code_magic,size);
-        uint64_t hash=14695981039346656037ULL;for(unsigned j=0;j<0x880;j++)hash=(hash^control[j])*1099511628211ULL;
-        char key[32];snprintf(key,sizeof(key),"%016llx",(unsigned long long)hash);
+        if(!control)continue;
+        // The code area may still be unmapped at this point: a title is allowed
+        // to name an address and fill it in before the first draw. Never read
+        // through it unconditionally.
+        uint32_t magic=0,code_magic=0,size=0;memcpy(&magic,control,4);if(code)memcpy(&code_magic,code,4);memcpy(&size,control+0x704,4);
+        // An unrecognized control section is a stage that is not filled in yet,
+        // not a corrupt one: a title may set a placeholder (0x12345678 with a
+        // zero length) and provide the real section later. Skip it so the rest
+        // of the program can still resolve.
+        if(magic!=0x98761234 || size<8 || size>8*1024*1024) {
+            ot2_host_log("SHADER skip stage=%u magic=%#x size=%#x code=%s",stage,magic,size,code?"mapped":"unmapped");
+            continue;
+        }
+        // The control section carries its own length at +0x20; hashing a fixed
+        // 0x880 over a shorter section would produce a key the cache cannot have.
+        // The code area takes part as well, for the reason given at shader_key:
+        // this title has 613 shaders that share a control section.
+        uint32_t nctl=0x880,own=0;memcpy(&own,control+0x20,4);
+        if(own>=0x760&&own<0x880)nctl=own;
+        const auto key=shader_key(control,code,size?size:0);
         const auto base=shader_directory+"/"+key;
-        if(!complete_shader_cache&&!std::filesystem::exists(base+".control")) {
-            std::ofstream(base+".control",std::ios::binary).write(reinterpret_cast<const char*>(control),0x880);
-            std::ofstream(base+".code",std::ios::binary).write(reinterpret_cast<const char*>(code),size);
-            ot2_host_log("SHADER %s size=%x code_magic=%x",key,size,code_magic);
+        // Whether the host's key and the offline cache agree is the single most
+        // useful fact when a shader fails to resolve, so report it per stage.
+        {
+            static std::atomic<unsigned> reported{0};
+            const unsigned n=reported.fetch_add(1,std::memory_order_relaxed);
+            if(n<24) {
+                std::error_code ec;
+                // The pipeline loader reads from shader_binary_directory, so the
+                // check has to look there too. Probing only shader_directory
+                // reported every packaged shader as a miss, which sends the next
+                // debugging session after a cache that is in fact present.
+                const bool cached=std::filesystem::exists(shader_binary_directory+"/"+key+".spv",ec)
+                                 ||std::filesystem::exists(base+".spv",ec);
+                ot2_host_log("SHADER %s stage=%u nctl=%#x size=%#x cache=%s dir=%s",key.c_str(),stage,nctl,size,cached?"HIT":"MISS",shader_binary_directory.c_str());
+            }
+        }
+        // A key the packaged cache does not know is a shader this title builds at
+        // run time rather than one shipped in RomFS — the offline extractor can
+        // never have seen it. Keep the control and code so a later offline pass
+        // can translate them and grow the cache; without the bytes the gap is
+        // unrecoverable once the process exits.
+        const bool captured=std::filesystem::exists(base+".spv");
+        {
+            // Why a shader is not captured matters more than the miss itself: a
+            // missing code pointer and an already-captured key look identical in
+            // the cache line, but only the first one loses the bytes forever.
+            static std::atomic<unsigned> why{0};
+            const unsigned n=why.fetch_add(1,std::memory_order_relaxed);
+            if(n<24) ot2_host_log("SHADER_WHY %s stage=%u code=%p captured=%d complete=%d dir=%s",
+                key.c_str(),stage,reinterpret_cast<const void*>(code),captured?1:0,complete_shader_cache?1:0,
+                shader_directory.c_str());
+        }
+        if(!captured && code) {
+            std::string dir=complete_shader_cache?shader_directory+"/captures":shader_directory;
+            std::error_code ec;std::filesystem::create_directories(dir,ec);
+            const auto target=dir+"/"+key;
+            if(!std::filesystem::exists(target+".control")) {
+                std::ofstream(target+".control",std::ios::binary).write(reinterpret_cast<const char*>(control),nctl);
+                std::ofstream(target+".code",std::ios::binary).write(reinterpret_cast<const char*>(code),size);
+                // The offline prepare step infers texture and attribute facts by
+                // reading the assembly text that follows the control section.
+                // The console serialises the whole block length just before the
+                // control, so that word gives the end of the assembly too.
+                uint32_t block=0;memcpy(&block,control-4,4);
+                if(block>0x880 && block<=0x40000) {
+                    std::ofstream(target+".asm",std::ios::binary)
+                        .write(reinterpret_cast<const char*>(control+0x880),block-0x880);
+                }
+                static std::atomic<unsigned> captured_count{0};
+                const unsigned n=captured_count.fetch_add(1,std::memory_order_relaxed);
+                if(n<40)ot2_host_log("SHADER_CAPTURE %s stage=%u nctl=%#x size=%#x block=%#x",key.c_str(),stage,nctl,size,block);
+            }
         }
     }
 }
@@ -1362,6 +1851,42 @@ extern "C" void vkhost_submit(int n,const uint64_t* handles) {
 }
 extern "C" uint64_t vkhost_frame_count() {return presented_frames.load();}
 extern "C" void vkhost_frame_stats(double out[4]){std::lock_guard lock(frame_stats_mutex);auto s=frame_stats.sample(monotonic_ns());out[0]=s.fps;out[1]=s.mean_ms;out[2]=s.p95_ms;out[3]=s.source;}
+// A blank frame can be blamed on the guest or on the translator forever unless
+// the exact image the guest hands to present is measured. This reports that
+// image's identity plus a quantised colour histogram, so "nothing renders" and
+// "one flat colour is presented" stop looking the same from the outside.
+static void present_digest(const tex_t& texture) {
+    auto& img=image_for(texture);
+    if(img.aspects!=VK_IMAGE_ASPECT_COLOR_BIT)return;
+    int bw,bh,bytes=nvn_fmt_bpb(texture.d.format,&bw,&bh);
+    const unsigned w=texture.d.width,h=texture.d.height;
+    if(bw!=1||bh!=1||!w||!h||size_t(w)*h*bytes>32u*1024*1024)return;
+    const size_t size=size_t(w)*h*bytes;
+    auto buffer=make_buffer(nullptr,size,VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    VkBufferImageCopy copy{};copy.bufferOffset=buffer.offset;copy.imageSubresource={img.aspects,0,0,1};copy.imageExtent={w,h,1};
+    flush_commands();
+    auto cmd=begin_commands();barrier(cmd,img,img.layout,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    vkCmdCopyImageToBuffer(cmd,img.image,img.layout,buffer.buffer,1,&copy);finish_commands(cmd);flush_commands();
+    static uint32_t histogram[65536];
+    memset(histogram,0,sizeof histogram);
+    const auto* pixels=static_cast<const uint8_t*>(buffer.mapped);
+    uint64_t samples=0;unsigned long long sr=0,sg=0,sb=0;
+    const unsigned step=std::max(1U,h/128u);
+    for(unsigned y=0;y<h;y+=step)for(unsigned x=0;x<w;x+=4){
+        const uint8_t* p=pixels+size_t(y)*w*bytes+size_t(x)*bytes;
+        const unsigned r=p[bytes>=3?0:0],g=p[bytes>=3?1:0],b=p[bytes>=3?2:0];
+        sr+=r;sg+=g;sb+=b;++samples;
+        const unsigned bucket=((r>>3)<<11)|((g>>3)<<5)|(b>>3);
+        ++histogram[bucket];
+    }
+    destroy_buffer(buffer);
+    unsigned best=0;uint32_t best_count=0,distinct=0;
+    for(unsigned i=0;i<65536;i++)if(histogram[i]){++distinct;if(histogram[i]>best_count){best_count=histogram[i];best=i;}}
+    ot2_host_log("PRESENT_TEX serial=%llu %ux%u fmt=%u bpp=%d samples=%llu distinct=%u dominant=(%u,%u,%u) share=%.3f mean=(%llu,%llu,%llu)",
+        (unsigned long long)texture.serial,w,h,texture.d.format,bytes,(unsigned long long)samples,distinct,
+        ((best>>11)&31)<<3,((best>>5)&63)<<2,(best&31)<<3,samples?double(best_count)/samples:0.,
+        (unsigned long long)(samples?sr/samples:0),(unsigned long long)(samples?sg/samples:0),(unsigned long long)(samples?sb/samples:0));
+}
 static void present_frame(const tex_t* texture,int interval,const int* crop,uint64_t dependency) {
     FrameTraceScope trace("OT2 present frame");
     const auto work_end=monotonic_ns();
@@ -1422,6 +1947,14 @@ static void present_frame(const tex_t* texture,int interval,const int* crop,uint
     if(acquire_result==VK_ERROR_OUT_OF_DATE_KHR){check(vkQueueWaitIdle(queue),"resize wait");destroy_swapchain();return;}
     if(acquire_result!=VK_SUBOPTIMAL_KHR)check(acquire_result,"acquire image");
     check(vkWaitForFences(device,1,&acquired,VK_TRUE,UINT64_MAX),"acquire completion");
+    static std::atomic<uint64_t> present_probe{0};
+    // Sampling every 60th frame aliases against a double-buffered target: 60 is
+    // even, so every sample lands on the same buffer and the other one is
+    // invisible. The first presents are therefore recorded one by one.
+    const uint64_t present_index=present_probe.fetch_add(1,std::memory_order_relaxed);
+    if(present_index<240)ot2_host_log("PRESENT_ID n=%llu serial=%llu %ux%u fmt=%u",(unsigned long long)present_index,
+        (unsigned long long)texture->serial,texture->d.width,texture->d.height,texture->d.format);
+    if(present_index<4||present_index%37==0)present_digest(*texture);
     auto& source=image_for(*texture);Image target{};target.image=swapchain_images[index];target.format=swapchain_format;target.aspects=VK_IMAGE_ASPECT_COLOR_BIT;target.layers=target.levels=1;
     auto cmd=begin_commands();encode_present_pixels(cmd,*texture,target,swapchain_views[index],swapchain_extent,crop);
     barrier(cmd,target,target.layout,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);finish_commands(cmd);
@@ -1462,6 +1995,22 @@ static void present_frame(const tex_t* texture,int interval,const int* crop,uint
     if(frame%60==0){
         detail_timing=std::filesystem::exists(shader_directory+"/profile-cpu-detail");
         stats_enabled=detail_timing||std::filesystem::exists(shader_directory+"/verbose-stats");
+        opaque_blend_forced=std::filesystem::exists(shader_directory+"/opaque-blend");
+        sprite_pixels_forced=std::filesystem::exists(shader_directory+"/sprite-pixels");
+        {std::ifstream scale(shader_directory+"/sprite-pixels");float v=0;if(scale>>v&&v>0&&v<1024)sprite_pixel_scale=v;}
+        sprite_instance_scale=1.f;
+        {std::ifstream scale(shader_directory+"/sprite-instance-scale");float v=0;if(scale>>v&&v>0.5f&&v<1e5f)sprite_instance_scale=v;}
+        {std::ifstream probe(shader_directory+"/sprite-scale");float v=0;if(probe>>v&&v>1&&v<4096)sprite_scale_probe=v;}
+        paint_draws_probe=std::filesystem::exists(shader_directory+"/paint-draws");
+        ui_matrix_probe=std::filesystem::exists(shader_directory+"/ui-matrix");
+        trace_uniform_banks=std::filesystem::exists(shader_directory+"/trace-uniforms");
+        bank_dump_probe=std::filesystem::exists(shader_directory+"/bank-dump");
+        cull_none_forced=std::filesystem::exists(shader_directory+"/no-cull");
+        winding_not_flipped=std::filesystem::exists(shader_directory+"/keep-winding");
+        force_no_depth=std::filesystem::exists(shader_directory+"/no-depth-attach");
+        sprite_rect_w=640.f;sprite_rect_h=360.f;
+        {std::ifstream rect(shader_directory+"/sprite-rect");float v=0;if(rect>>v&&v>0&&v<8192)sprite_rect_w=v;
+         if(rect>>v&&v>0&&v<8192)sprite_rect_h=v;}
         frame_trace_enabled=std::filesystem::exists(shader_directory+"/trace-frame");
         const bool stream_optimized=!std::filesystem::exists(shader_directory+"/no-stream-optimizations");
         if(ot2_host_stream_profile)ot2_host_stream_profile(stream_optimized&&!std::filesystem::exists(shader_directory+"/no-stream-io"));
@@ -1535,6 +2084,7 @@ static void present_frame(const tex_t* texture,int interval,const int* crop,uint
         const bool next_dynamic=std::filesystem::exists(shader_directory+"/dynamic-descriptors")&&!std::filesystem::exists(shader_directory+"/no-dynamic-descriptors");
         if(next_dynamic!=dynamic_buffer_descriptors){dynamic_buffer_descriptors=next_dynamic;reset_binding_cache();}
         verbose_gpu_logs=std::filesystem::exists(shader_directory+"/verbose-gpu-logs");
+        {std::ifstream traced(shader_directory+"/trace-ops-frame");uint64_t value=0;if(traced>>value&&value){trace_ops_frame=value;trace_op_index=0;memset(trace_op_hist,0,sizeof trace_op_hist);ot2_host_log("OP_TRACE armed for frame %llu",(unsigned long long)value);}}
         polling_pacer=std::filesystem::exists(shader_directory+"/polling-pacer");
         stats_log("PRESENT_SCHEDULE prepare_first=%u queue_early=%u prepare_ms=%.3f late_ms=%.3f max_late_ms=%.3f",prepare_first,queue_early,present_prepare_ns/60e6,present_late_ns/60e6,present_late_max_ns/1e6);
         present_prepare_ns=present_late_ns=present_late_max_ns=0;
@@ -1571,7 +2121,37 @@ static void present_frame(const tex_t* texture,int interval,const int* crop,uint
         stats_log("ATTACHMENT_STORES enabled=%u color_none=%llu depth_none=%llu stencil_none=%llu promotions=%llu fallbacks=%llu",readonly_stores_enabled,(unsigned long long)attachment_stores.none[0],(unsigned long long)attachment_stores.none[1],(unsigned long long)attachment_stores.none[2],(unsigned long long)attachment_stores.promotions,(unsigned long long)attachment_stores.fallbacks);
         attachment_stores={};readonly_stores_enabled=std::filesystem::exists(shader_directory+"/readonly-stores")&&!std::filesystem::exists(shader_directory+"/no-readonly-stores");
     }
-    if(frame%60==0){static uint64_t previous_ns=0;timespec ts{};clock_gettime(CLOCK_MONOTONIC,&ts);uint64_t now=uint64_t(ts.tv_sec)*1000000000+ts.tv_nsec;if(previous_ns)ot2_host_log("PRESENT_RATE frames=60 seconds=%.3f fps=%.2f",double(now-previous_ns)/1e9,60e9/double(now-previous_ns));previous_ns=now;}
+    if(frame%60==0){
+        // A frame can present steadily while drawing nothing at all, so the
+        // view state is reported next to the geometry counters: a zero-sized
+        // scissor or an inverted viewport silently discards every draw without
+        // touching any of them.
+        ot2_host_log("VIEW_STATE viewport=%.1f,%.1f,%.1fx%.1f,%.2f..%.2f scissor=%d,%d,%dx%d enable=%u depth_test=%u depth_write=%u depth_func=%u color_mask=%#x samples=%u",
+            render_state.viewport[0],render_state.viewport[1],render_state.viewport[2],render_state.viewport[3],
+            render_state.viewport[4],render_state.viewport[5],
+            render_state.scissor.x,render_state.scissor.y,render_state.scissor.w,render_state.scissor.h,
+            render_state.render_enable,unsigned(render_state.depth_stencil.dt),unsigned(render_state.depth_stencil.dw),
+            unsigned(render_state.depth_stencil.df),render_state.channel_mask.mask,unsigned(render_state.multisample.samples));
+        // Blend decides whether a draw changes the pixel at all: factors that
+        // multiply the source out to zero leave the cleared colour untouched and
+        // the frame presents as if nothing had been drawn.
+        ot2_host_log("BLEND_STATE enable=%#x t0_target=%u src_rgb=%u dst_rgb=%u src_a=%u dst_a=%u eq_rgb=%u eq_a=%u forced=%d",
+            render_state.color.blend_en,unsigned(render_state.blends[0].target),
+            unsigned(render_state.blends[0].src_rgb),unsigned(render_state.blends[0].dst_rgb),
+            unsigned(render_state.blends[0].src_a),unsigned(render_state.blends[0].dst_a),
+            unsigned(render_state.blends[0].eq_rgb),unsigned(render_state.blends[0].eq_a),int(opaque_blend_forced));
+        // How much of the frame's geometry actually reached the GPU. A title can run
+        // at a steady frame rate while drawing nothing -- the clear still presents --
+        // so the presented rate alone does not say whether rendering works.
+        ot2_host_log("DRAW_FILTER skipped_missing=%llu cond_undecided=%llu cond_decided=%llu cond_skipped=%llu unbound_attr=%llu",
+            (unsigned long long)skipped_missing_draws,(unsigned long long)undecided_conditional_draws,
+            (unsigned long long)decided_conditional_draws,(unsigned long long)skipped_conditional_draws,
+            (unsigned long long)unbound_attribute_draws.load(std::memory_order_relaxed));
+        ot2_host_log("DRAW_SUBMITTED draws=%llu indices=%llu vertices=%llu",
+            (unsigned long long)draws_submitted.load(std::memory_order_relaxed),
+            (unsigned long long)indices_submitted.load(std::memory_order_relaxed),
+            (unsigned long long)vertices_submitted.load(std::memory_order_relaxed));
+        static uint64_t previous_ns=0;timespec ts{};clock_gettime(CLOCK_MONOTONIC,&ts);uint64_t now=uint64_t(ts.tv_sec)*1000000000+ts.tv_nsec;if(previous_ns)ot2_host_log("PRESENT_RATE frames=60 seconds=%.3f fps=%.2f",double(now-previous_ns)/1e9,60e9/double(now-previous_ns));previous_ns=now;}
     if(frame%60==0&&geometry_query_workaround)stats_log("SOFTWARE_SAMPLES draws=%llu",(unsigned long long)software_sample_draws);
     if(frame%60==0){stats_log("PIPELINE_CACHE foreground=%llu warm=%llu claimed=%llu rejected=%llu running=%u",(unsigned long long)foreground_created.load(),(unsigned long long)warm_created.load(),(unsigned long long)warm_claimed.load(),(unsigned long long)warm_rejected.load(),warm_running.load());asynchronous_gpu=!std::filesystem::exists(shader_directory+"/synchronous-gpu");stats_log("GPU_RING enabled=%u peak=%llu slots=%zu reuses=%llu",asynchronous_gpu,(unsigned long long)gpu_inflight_peak,gpu_ring_size,(unsigned long long)gpu_ring_reuses);batch_query_resets=!std::filesystem::exists(shader_directory+"/synchronous-queries");buffer_mirrors_enabled=!std::filesystem::exists(shader_directory+"/no-buffer-mirrors");reuse_bindings=!std::filesystem::exists(shader_directory+"/uncached-bindings");gpu_deswizzle_enabled=!std::filesystem::exists(shader_directory+"/cpu-deswizzle");stats_log("BUFFER_MIRRORS enabled=%u reuses=%llu writebacks=%llu",buffer_mirrors_enabled,(unsigned long long)mirror_reuses,(unsigned long long)mirror_writebacks);batch_enabled=!std::filesystem::exists(shader_directory+"/synchronous");merge_enabled=!std::filesystem::exists(shader_directory+"/separate-passes");reuse_descriptors=!std::filesystem::exists(shader_directory+"/uncached-descriptors");stats_log("FRAME_COST frames=60 passes=%llu submits=%llu wait_ms=%.3f draw_ms=%.3f buffer_ms=%.3f upload_mb=%.3f vertex_mb=%.3f uniform_mb=%.3f storage_mb=%.3f allocs=%llu pipeline_ms=%.3f replay_ms=%.3f",(unsigned long long)perf.passes,(unsigned long long)perf.submits,perf.wait_ns/60e6,perf.draw_ns/60e6,perf.buffer_ns/60e6,perf.buffer_bytes/(60.0*1048576),perf.vertex_bytes/(60.0*1048576),perf.uniform_bytes/(60.0*1048576),perf.storage_bytes/(60.0*1048576),(unsigned long long)perf.buffer_allocs,perf.pipeline_ns/60e6,perf.replay_ns/60e6);report_descriptors();perf={};}
     if(source.drawn && (frame<=10 || frame%60==0))(frame<=10?ot2_host_log:stats_log)("GAME_FRAME_PRESENTED frame=%llu draw=%llu",(unsigned long long)frame,(unsigned long long)source.drawn);

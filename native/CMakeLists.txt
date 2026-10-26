@@ -18,18 +18,69 @@ target_compile_options(ot2loader PRIVATE -Wall -Wextra)
 add_library(ot2time STATIC time_zone.cpp)
 set_target_properties(ot2time PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_options(ot2time PRIVATE -Wall -Wextra)
+
+# ---- Graphics backend choice -------------------------------------------------
+# "ot2"  : this project's own NVN replay (graphics/backend.cpp + draw.inc)
+# "d2r"  : the d2r-mobile Vulkan engine (d2r/gfx/vulkan/engine) driven through
+#          graphics/d2r_bridge.cpp, which owns the VkInstance/device/swapchain
+# Exactly one of the two implements vkhost_*, so they are never built together.
+set(S2A_GRAPHICS_BACKEND "ot2" CACHE STRING "Graphics backend: ot2 or d2r")
+set_property(CACHE S2A_GRAPHICS_BACKEND PROPERTY STRINGS ot2 d2r)
+
+set(S2A_GRAPHICS_SOURCES graphics/frontend.c graphics/nvn_commands.cpp
+    graphics/nvn_program.cpp graphics/nvn_tex.c graphics/nvn_deswizzle.c)
+if(S2A_GRAPHICS_BACKEND STREQUAL "d2r")
+    list(APPEND S2A_GRAPHICS_SOURCES graphics/d2r_bridge.cpp)
+else()
+    list(APPEND S2A_GRAPHICS_SOURCES graphics/backend.cpp)
+endif()
+
+if(S2A_GRAPHICS_BACKEND STREQUAL "d2r" AND ANDROID)
+    set(D2R_ENGINE ${CMAKE_CURRENT_SOURCE_DIR}/d2r/gfx/vulkan/engine)
+    # Upstream's source list (d2r/gfx/vulkan/CMakeLists.txt), one for one, plus
+    # the Android shims (CommonCrypto SHA-256) and d2r_host.c's three symbols.
+    add_library(d2r_engine STATIC
+        ${D2R_ENGINE}/xbg_game.cpp ${D2R_ENGINE}/xbg_shader_key.c ${D2R_ENGINE}/xbg_command_clone.c
+        ${D2R_ENGINE}/xbg_draw_plan.c ${D2R_ENGINE}/xbg_vertex.c ${D2R_ENGINE}/xbg_quad.c
+        ${D2R_ENGINE}/xbg_stages.cpp ${D2R_ENGINE}/xbg_clear.cpp ${D2R_ENGINE}/xbg_blit.cpp
+        ${D2R_ENGINE}/xbg_texture.c ${D2R_ENGINE}/xbg_depth.c ${D2R_ENGINE}/xbg_framebuffer.c
+        ${D2R_ENGINE}/xbg_vulkan.cpp ${D2R_ENGINE}/xbg_nvn.cpp ${D2R_ENGINE}/xbg_sampler.cpp
+        ${D2R_ENGINE}/xbg_spirv_quad.cpp ${D2R_ENGINE}/xbg_spirv_warp.cpp
+        ${D2R_ENGINE}/xbg_spirv_ldc.cpp ${D2R_ENGINE}/xbg_spirv_temps.cpp
+        ${D2R_ENGINE}/xbg_spirv_raster.cpp
+        d2r/compat/CommonDigest.c d2r/d2r_host.c)
+    set_target_properties(d2r_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(d2r_engine PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/d2r/compat
+        ${CMAKE_CURRENT_SOURCE_DIR}/d2r/gfx/vulkan
+        ${CMAKE_CURRENT_SOURCE_DIR}/d2r/gfx/vulkan/engine
+        ${CMAKE_CURRENT_SOURCE_DIR}/d2r/gfx/nvn
+        ${CMAKE_CURRENT_SOURCE_DIR}/d2r/gfx/nvn/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/graphics
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(d2r_engine PROPERTIES CXX_STANDARD 17 C_STANDARD 11)
+    target_compile_options(d2r_engine PRIVATE -O2 -fno-strict-aliasing -Wno-missing-field-initializers -Wno-format)
+    # xbg_texture.c's BC4/5 endpoint maths needs the library's signed-char
+    # assumption, exactly as upstream's own CMakeLists specifies.
+    set_source_files_properties(${D2R_ENGINE}/xbg_texture.c PROPERTIES COMPILE_OPTIONS "-fsigned-char")
+    target_link_libraries(d2r_engine PUBLIC vulkan log android)
+endif()
+
 if(NOT ANDROID OR OT2_DEVICE_CONTRACT_TESTS)
     add_executable(ot2-time-contract-test tests/time_contract_test.cpp host_services.cpp save_transaction.cpp text_input.cpp)
     target_link_libraries(ot2-time-contract-test PRIVATE ot2dirty ot2time)
 endif()
 if(ANDROID)
-    add_library(ot2host SHARED probe.cpp guest.cpp native_abi.cpp guest_context.cpp guest_entry.S thread_services.c host_services.cpp save_transaction.cpp text_input.cpp audio.cpp input.cpp movie.cpp
-        graphics/frontend.c graphics/nvn_commands.cpp graphics/nvn_program.cpp graphics/nvn_tex.c graphics/nvn_deswizzle.c graphics/backend.cpp)
+    add_library(ot2host SHARED probe.cpp guest.cpp native_abi.cpp guest_context.cpp guest_entry.S thread_services.c host_services.cpp save_transaction.cpp text_input.cpp audio.cpp audio_renderer.cpp shared_font.cpp input.cpp movie.cpp content_locale.cpp
+        ${S2A_GRAPHICS_SOURCES})
     target_compile_options(ot2host PRIVATE -O2 -g -fno-omit-frame-pointer)
     target_compile_options(ot2loader PRIVATE -O2 -g -fno-omit-frame-pointer)
     target_compile_options(ot2dirty PRIVATE -O2 -g -fno-omit-frame-pointer)
     target_compile_options(ot2time PRIVATE -O2 -g -fno-omit-frame-pointer)
     target_link_libraries(ot2host PRIVATE ot2loader ot2dirty ot2time ot2shadercompat ot2bc vulkan log android aaudio mediandk)
+    if(S2A_GRAPHICS_BACKEND STREQUAL "d2r")
+        target_link_libraries(ot2host PRIVATE d2r_engine)
+    endif()
     target_link_options(ot2host PRIVATE "-Wl,-z,max-page-size=16384")
     if(OT2_DEVICE_CONTRACT_TESTS)
         add_executable(ot2-host-stack-test tests/host_stack_test.cpp)
@@ -80,6 +131,7 @@ else()
     add_executable(ot2-frame-rate-patch-test tests/frame_rate_patch_test.cpp)
     add_executable(ot2-pace-test tests/pace_test.c)
     add_executable(ot2-text-input-test tests/text_input_test.cpp text_input.cpp)
+    add_executable(ot2-content-locale-test tests/content_locale_test.cpp content_locale.cpp)
     add_executable(ot2-shader-reflection-test tests/shader_reflection_test.cpp)
     add_executable(ot2-nvn-frontend-test tests/nvn_frontend_test.cpp tests/nvn_test_host.cpp graphics/frontend.c graphics/nvn_commands.cpp graphics/nvn_program.cpp graphics/nvn_tex.c graphics/nvn_deswizzle.c)
     target_compile_definitions(ot2-nvn-frontend-test PRIVATE OT2_FRONTEND_ONLY=1)
@@ -125,6 +177,7 @@ else()
     add_test(NAME frame-rate-patch COMMAND ot2-frame-rate-patch-test)
     add_test(NAME present-pace COMMAND ot2-pace-test)
     add_test(NAME text-input COMMAND ot2-text-input-test)
+    add_test(NAME content-locale COMMAND ot2-content-locale-test)
     add_test(NAME nvn-frontend COMMAND ot2-nvn-frontend-test)
     add_test(NAME host-services COMMAND ot2-host-services-test)
     add_test(NAME time-contract COMMAND ot2-time-contract-test)

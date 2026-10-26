@@ -867,6 +867,14 @@ uint64_t depth_idle_passes=0;
 // Diagnostic (NVN PERF pass_ends): render-pass ends and full barriers per frame, by the guest op being executed
 // (pseudo-ops: 60 submit, 61 present, 62 storage-writing draw).
 unsigned cur_op=0;uint64_t pass_end_by[64],barrier_by[64];
+// gfx-defer-clear（标记存在即开，缺省关）：折不进当前通道的整幅清屏，推迟到下一个带同一附件的通道里做。
+// 否则引擎会为它单开一个只带深度（或只带颜色）的通道；Adreno 在这两种 framebuffer 之间切换时必须把全部彩色附件
+// 写回内存、下一个通道再读回来。本作小游戏每帧 4 次这样的切换，每次实测 1.35 ms（占帧内 11 ms 的 5.4 ms 气泡）。
+// gfx-defer-clear (marker = on, default off): a full clear that cannot fold into the open pass is deferred to the next
+// pass carrying the same image. Otherwise the engine opens a depth-only pass just for the clear, and each such
+// framebuffer switch makes Adreno store every colour attachment and reload it - 4 times a frame, 1.35 ms each here.
+void flush_clears();
+bool defer_clear=false;uint64_t deferred_clears=0,flushed_clears=0;
 // Samples-passed counting: one precise occlusion query per run of counted draws inside a pass (Metal counts per pass,
 // nvn_mtl.m), not one per draw. A run ends with its pass, at a counter reset, and at a report (which ends the pass), so a
 // report still sums exactly the draws since its reset. ~2200 begin/end pairs per D2R camp frame cost the Adreno 730
@@ -966,8 +974,12 @@ void retire_slot(Slot &s){
             if(!r.complete || r.q0>=t.size() || r.q1>=t.size() || !t[r.q0].available || !t[r.q1].available)continue;
             double us=double((t[r.q1].value-t[r.q0].value)&mask)*per;
             if(!complete)first=t[r.q0].value;last=t[r.q1].value;++complete;
-            if(r.compute){compute_us+=us;xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u i=%zu kind=compute us=%.0f cs=%s groups=%u,%u,%u",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),i,us,r.first.c_str(),r.x,r.y,r.z);}
-            else{pass_us+=us;xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u i=%zu kind=pass us=%.0f %ux%u att=%u fmt=%u draws=%u verts=%llu first=%s last=%s mixed=%u dz=%u",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),i,us,r.w,r.h,r.att,r.fmt,r.draws1-r.draws0,(unsigned long long)(r.verts1-r.verts0),r.first.empty()?"builtin-clear/no-game-draw":r.first.c_str(),r.last.empty()?"builtin-clear/no-game-draw":r.last.c_str(),unsigned(r.mixed),unsigned(r.dz));}
+            // 时间轴打点：t0/t1 是相对本帧首个完整记录起点的偏移，据此可以算出相邻 pass 之间的空档
+            // Timeline: t0/t1 are offsets in us from this frame's first complete record, so the idle time between
+            // consecutive passes is (next.t0 - this.t1) and can be attributed to the commands in between.
+            double t0=double((t[r.q0].value-first)&mask)*per;
+            if(r.compute){compute_us+=us;xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u i=%zu kind=compute us=%.0f t0=%.0f t1=%.0f cs=%s groups=%u,%u,%u",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),i,us,t0,t0+us,r.first.c_str(),r.x,r.y,r.z);}
+            else{pass_us+=us;xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u i=%zu kind=pass us=%.0f t0=%.0f t1=%.0f %ux%u att=%u fmt=%u draws=%u verts=%llu first=%s last=%s mixed=%u dz=%u",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),i,us,t0,t0+us,r.w,r.h,r.att,r.fmt,r.draws1-r.draws0,(unsigned long long)(r.verts1-r.verts0),r.first.empty()?"builtin-clear/no-game-draw":r.first.c_str(),r.last.empty()?"builtin-clear/no-game-draw":r.last.c_str(),unsigned(r.mixed),unsigned(r.dz));}
         }
         if(complete)span_us=double((last-first)&mask)*per;
         xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u summary recorded=%zu complete=%zu skipped=%u queries=%u result=%d pass_us=%.0f compute_us=%.0f span_us=%.0f",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),s.prof_recs.size(),complete,s.prof_skipped,s.prof_used,int(status),pass_us,compute_us,span_us);
@@ -1037,6 +1049,7 @@ Slot &recording_slot(){
 }
 // Submit the recording slot. With wait, block until all submitted work is done.
 void submit_slots(bool wait){
+    flush_clears();   // 提交前把没人认领的待决清屏落地，绝不跨帧遗留 | land unclaimed deferred clears before submitting
     Slot &s=slots[slot_index];
     if(s.recording){
         if(open_pass.cmd==s.cmd){unsigned saved=cur_op;cur_op=60;end_open_pass();cur_op=saved;}barrier_seq=0;
@@ -1170,6 +1183,7 @@ void perf_frame(){
     xbg_logf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
     xbg_logf("NVN PERF xview views=%.2f races=%.2f guarded=%.2f guarded_kb=%.1f",xviews/f,xview_races/f,xview_guarded/f,xview_guarded_bytes/1024.0/f);xviews=xview_races=xview_guarded=xview_guarded_bytes=0;
     if(uploads_prologue || uploads_inpass){xbg_logf("NVN PERF uploads window prologue=%llu inpass=%llu broke_pass=%llu",(unsigned long long)uploads_prologue,(unsigned long long)uploads_inpass,(unsigned long long)uploads_broke_pass);uploads_prologue=uploads_inpass=uploads_broke_pass=0;}
+    if(deferred_clears || flushed_clears){xbg_logf("NVN PERF deferclear window deferred=%llu flushed=%llu",(unsigned long long)deferred_clears,(unsigned long long)flushed_clears);deferred_clears=flushed_clears=0;}
     if(shaders_reused || shader_reuse_mismatches){xbg_logf("NVN PERF shader_reuse window reused=%llu mismatches=%llu",(unsigned long long)shaders_reused,(unsigned long long)shader_reuse_mismatches);shaders_reused=shader_reuse_mismatches=0;}
     if(wb_skip){xbg_logf("NVN PERF wbskip ab=%d skipped=%.1f (%.2fMB)",int(ab_frame_on),wb_skipped/f,wb_skipped_bytes/1048576.0/f);wb_skipped=wb_skipped_bytes=0;}
     if(pipe_memo){xbg_logf("NVN PERF pipememo ab=%d hits=%.1f misses=%.1f",int(ab_frame_on),pipe_memo_hits/f,pipe_memo_misses/f);pipe_memo_hits=pipe_memo_misses=0;}
@@ -3396,7 +3410,25 @@ void pass_prof_draw(VkCommandBuffer cmd){Slot &s=slots[slot_index];if(!s.prof ||
 int pass_prof_compute_begin(VkCommandBuffer cmd,const p_dispatch &p){int index=pass_prof_reserve(cmd);if(index<0)return index;
     auto &r=slots[slot_index].prof_recs[index];r.compute=true;r.first=state.shader[5]->key;r.last=r.first;r.x=uint32_t(p.x);r.y=uint32_t(p.y);r.z=uint32_t(p.z);return index;
 }
-void begin_pass(Pass &p,Commands &c){pass_prof_begin(p,c.command);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=p.pass;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};vkCmdBeginRenderPass(c.command,&b,VK_SUBPASS_CONTENTS_INLINE);}
+struct PendingClear{Image *image;VkClearAttachment a;VkClearRect r;};
+std::vector<PendingClear> pending_clears;
+void begin_pass(Pass &p,Commands &c){pass_prof_begin(p,c.command);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=p.pass;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};vkCmdBeginRenderPass(c.command,&b,VK_SUBPASS_CONTENTS_INLINE);
+    // 本通道带着待决清屏的目标：就在这里清，省掉一个只有该附件的中间通道。
+    // This pass carries a deferred clear's target: do it here and the extra single-attachment pass disappears.
+    if(!pending_clears.empty())for(size_t k=0;k<pending_clears.size();){bool hit=false;for(auto *im:p.images)if(im==pending_clears[k].image)hit=true;
+        if(!hit){++k;continue;}
+        VkClearRect r=pending_clears[k].r;if(r.rect.extent.width>p.width)r.rect.extent.width=p.width;if(r.rect.extent.height>p.height)r.rect.extent.height=p.height;
+        if(r.rect.extent.width && r.rect.extent.height)vkCmdClearAttachments(c.command,1,&pending_clears[k].a,1,&r);
+        pending_clears.erase(pending_clears.begin()+k);}}
+// 到这一步还没有通道来认领的待决清屏（例如清完就直接提交）：整幅清掉，语义与原先单开通道清屏一致。
+// Deferred clears no pass claimed (e.g. the frame was submitted first): clear the whole image, same result as before.
+void flush_clears(){if(pending_clears.empty())return;
+    std::vector<PendingClear> work;work.swap(pending_clears);
+    for(auto &pc:work){unsigned saved=cur_op;cur_op=63;Commands c;
+        VkImageSubresourceRange rg{(pc.a.aspectMask&VK_IMAGE_ASPECT_COLOR_BIT)?VK_IMAGE_ASPECT_COLOR_BIT:pc.image->aspects,0,pc.image->levels,0,pc.image->layers};
+        if(pc.a.aspectMask&VK_IMAGE_ASPECT_COLOR_BIT){VkClearColorValue v;memcpy(&v,&pc.a.clearValue.color,16);vkCmdClearColorImage(c.command,pc.image->image,pc.image->layout,&v,1,&rg);}
+        else vkCmdClearDepthStencilImage(c.command,pc.image->image,pc.image->layout,&pc.a.clearValue.depthStencil,1,&rg);
+        c.finish();pc.image->gpu_written=true;++flushed_clears;cur_op=saved;}}
 void capture_pass(Pass &pass){
     if(!capture.active)return;
     capture_log("PASS width=%u height=%u samples=%u viewport=%g,%g,%g,%g scissor=%d,%d,%u,%u mask=%#x blendEnable=%#x cull=%u front=%u depthTest=%u depthWrite=%u depthFunc=%u stencil=%u",pass.width,pass.height,unsigned(pass.samples),state.viewport.x,state.viewport.y,state.viewport.width,state.viewport.height,state.scissor.offset.x,state.scissor.offset.y,state.scissor.extent.width,state.scissor.extent.height,state.mask.mask,state.color.blend_en,state.poly.cull,state.poly.front,unsigned(state.ds.dt),unsigned(state.ds.dw),unsigned(state.ds.df),unsigned(state.ds.st));
@@ -3938,9 +3970,18 @@ void clear_attachment(const p_clear_color *color,const p_clear_ds *depth,int sca
         if(!needs_preserve || ti.gpu_written || ti.uploaded){
             Commands c(true);Pass p;
             if(create_pass(p,c,-1,false,true)){
-                if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){end_open_pass();begin_pass(p,c);open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
+                VkClearRect r{scissor(p),0,1};
+                const bool same=open_pass.cmd==c.command && open_pass.pass==p.pass && open_pass.framebuffer==p.framebuffer;
+                // 只推迟深度/模板的整幅清屏：颜色附件的清屏要按附件序号落位，换个通道序号可能不同，不冒险。
+                // Defer whole-surface depth/stencil clears only: a colour clear is addressed by attachment index, which
+                // another pass may order differently.
+                if(!same && defer_clear && !(a.aspectMask&VK_IMAGE_ASPECT_COLOR_BIT) && !capture.active && !capture.trace && !provenance_file
+                   && r.rect.offset.x==0 && r.rect.offset.y==0 && r.rect.extent.width==p.width && r.rect.extent.height==p.height){
+                    pending_clears.push_back({&ti,a,r});++deferred_clears;return;
+                }
+                if(!same){end_open_pass();begin_pass(p,c);open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
                 if(depth)open_pass.depth_used=true;
-                VkClearRect r{scissor(p),0,1};if(r.rect.extent.width && r.rect.extent.height)vkCmdClearAttachments(c.command,1,&a,1,&r);
+                if(r.rect.extent.width && r.rect.extent.height)vkCmdClearAttachments(c.command,1,&a,1,&r);
                 ++perf.folded_clears;return;
             }
         }
@@ -4502,7 +4543,10 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     // Retain the host's quiescent initialize/shutdown requirement; do not add reset notifications or session generations.
     fold_completion_wait_stats();completion_wait_enabled=completion_wait_default;
     if(const char *mode=getenv("DM_GFX_COMPLETION_WAIT")){if(!strcmp(mode,"0"))completion_wait_enabled=false;else if(!strcmp(mode,"1"))completion_wait_enabled=true;}
-    {std::string dir=c->shader_directory?c->shader_directory:"";size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-legacy-waitall").c_str(),"rb");if(m){legacy_waitall=fgetc(m)=='1';fclose(m);}}
+    {std::string dir=c->shader_directory?c->shader_directory:"";size_t cut=dir.find_last_of('/');const std::string base=cut==std::string::npos?dir:dir.substr(0,cut);
+        FILE *m=fopen((base+"/gfx-legacy-waitall").c_str(),"rb");if(m){legacy_waitall=fgetc(m)=='1';fclose(m);}
+        FILE *d=fopen((base+"/gfx-defer-clear").c_str(),"rb");if(d){defer_clear=true;fclose(d);}
+        xbg_logf("NVN opt defer_clear=%d legacy_waitall=%d",int(defer_clear),int(legacy_waitall));}
     cfg=*c;xbg_logf("NVN completion_wait enabled=%d legacy_waitall=%d",int(completion_wait_enabled),int(legacy_waitall));vkGetPhysicalDeviceProperties(cfg.physical,&properties);vkGetPhysicalDeviceMemoryProperties(cfg.physical,&memories);{char line[512];int at=snprintf(line,sizeof line,"NVN caps memory types");for(uint32_t i=0;i<memories.memoryTypeCount && at<int(sizeof line)-24;i++)at+=snprintf(line+at,sizeof line-at," %u:%#x/h%u",i,unsigned(memories.memoryTypes[i].propertyFlags),memories.memoryTypes[i].heapIndex);xbg_logf("%s",line);}
     VkPhysicalDeviceProperties2 pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};pp.pNext=&subgroup;vkGetPhysicalDeviceProperties2(cfg.physical,&pp);
     VkPhysicalDeviceFeatures available;vkGetPhysicalDeviceFeatures(cfg.physical,&available);const VkBool32 *want=reinterpret_cast<const VkBool32*>(&cfg.enabled_core),*have=reinterpret_cast<const VkBool32*>(&available);for(size_t i=0;i<sizeof(available)/sizeof(VkBool32);i++)if(want[i]&&!have[i]){if(error&&bytes)snprintf(error,bytes,"Requested enabled feature %zu is unsupported",i);return -1;}
@@ -4775,7 +4819,7 @@ extern "C" void xbg_legacy_finish(){gfx_drain();std::lock_guard<std::recursive_m
 #if XBG_CPU_MERGE_TEST
 #include "../tests/cpu_image_merge.h"
 #endif
-static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");
+static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();flush_clears();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");
 #if XBG_CPU_MERGE_TEST
 cpu_image_merge_test();
 #endif

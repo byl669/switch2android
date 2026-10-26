@@ -247,6 +247,16 @@ uint64_t commit(Registers r) {
 // Read-only mounts still report AlreadyExists for an existing create target,
 // as in D2R. This lets SDK "ensure directory/file" paths proceed to read it.
 bool create_target_exists(const char* guest){auto p=path(guest);struct stat st{};return !p.empty()&&!lstat(p.c_str(),&st);}
+// SDK 5.4.0.0 appended a trailing `int option` to CreateFile, so the mangled
+// name grew a third parameter and the two-argument entry stopped matching.
+// Nothing in the body reads past r[1], so one function serves both spellings.
+uint64_t create_file(Registers r) {
+    std::lock_guard lock(filesystem_mutex);if(int64_t(r[1])<0)return PermissionDenied;if(create_target_exists(str(r[0])))return PathExists;auto p=path(str(r[0]),true);if(p.empty())return PermissionDenied;
+    auto save=save_for_path(str(r[0]));int f=open(p.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
+    if(f<0){if(save&&(errno==ENOSPC||errno==EDQUOT||errno==EIO))save->poison(errno);return error();}
+    int rc=ftruncate(f,r[1]),e=rc?errno:0;if(close(f)&&!e)e=errno;
+    if(e){if(save)save->poison(e);unlink(p.c_str());return IoError;}return 0;
+}
 uint64_t open_directory(Registers r) {
     std::lock_guard lock(filesystem_mutex);auto p=path(str(r[1]));
     if(p.empty())return PathNotFound;
@@ -547,6 +557,14 @@ const std::vector<HostService>& host_services() {
         {"_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE",[](Registers r)->uint64_t{*ptr<uint64_t>(r[0])=reinterpret_cast<uint64_t>(&native_window_object);return 0;}},
         {"_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE",display_event},
         {"_ZN2nn2vi20GetLatestFrameNumberEPmPKNS0_5LayerE",[](Registers r)->uint64_t{*ptr<uint64_t>(r[0])=vkhost_frame_count();return 0;}},
+        // Layer attributes never reach this host: the picture goes to our own
+        // surface, not through Horizon's compositor. Answering the SDK's own
+        // implementation is not possible -- it resolves the stand-in layer
+        // through nn::vi's ObjectManager, finds nothing, and faults on the null
+        // at sdk+0x275614 (measured, Koei's engine calls this right after
+        // CreateLayer). Brain Academy never imports this entry, so gating it
+        // changes nothing for that title.
+        {"_ZN2nn2vi19SetLayerScalingModeEPNS0_5LayerENS0_11ScalingModeE",ok},
         // LoadedGame owns the static NSO module registry; no Horizon RO session.
         {"_ZN2nn2ro10InitializeEv",ok},
         {"nnsslInitialize",ok},
@@ -938,11 +956,8 @@ const std::vector<HostService>& host_services() {
         {"_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE",[](Registers r)->uint64_t{return r[0]==program_id && std::filesystem::is_directory(user+"/save");}},
         {"_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE",[](Registers r)->uint64_t{if(r[1]!=program_id || !std::filesystem::is_directory(user+"/save"))return PathNotFound;return mount(str(r[0]),user+"/save",true);}},
         {"_ZN2nn2fs7UnmountEPKc",[](Registers r)->uint64_t{std::lock_guard lock(filesystem_mutex);auto it=mounts.find(str(r[0]));if(it!=mounts.end()){if(it->second.save)invalidate_save_handles(it->second.save);mounts.erase(it);}return 0;}},
-        {"_ZN2nn2fs10CreateFileEPKcl",[](Registers r)->uint64_t{std::lock_guard lock(filesystem_mutex);if(int64_t(r[1])<0)return PermissionDenied;if(create_target_exists(str(r[0])))return PathExists;auto p=path(str(r[0]),true);if(p.empty())return PermissionDenied;
-            auto save=save_for_path(str(r[0]));int f=open(p.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
-            if(f<0){if(save&&(errno==ENOSPC||errno==EDQUOT||errno==EIO))save->poison(errno);return error();}
-            int rc=ftruncate(f,r[1]),e=rc?errno:0;if(close(f)&&!e)e=errno;
-            if(e){if(save)save->poison(e);unlink(p.c_str());return IoError;}return 0;}},
+        {"_ZN2nn2fs10CreateFileEPKcl",create_file},
+        {"_ZN2nn2fs10CreateFileEPKcli",create_file},
         {"_ZN2nn2fs10DeleteFileEPKc",[](Registers r)->uint64_t{std::lock_guard lock(filesystem_mutex);auto p=path(str(r[0]),true);if(p.empty())return PermissionDenied;return unlink(p.c_str())?error():0;}},
         {"_ZN2nn2fs10RenameFileEPKcS2_",[](Registers r)->uint64_t{std::lock_guard lock(filesystem_mutex);auto a=path(str(r[0]),true),b=path(str(r[1]),true);if(a.empty() || b.empty())return PermissionDenied;
             struct stat existing{};if(!lstat(b.c_str(),&existing))return PathExists;if(errno!=ENOENT)return error();return rename(a.c_str(),b.c_str())?error():0;}},
@@ -992,6 +1007,14 @@ const std::vector<HostService>& host_services() {
         {"_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci",open_file},
         {"_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm",read_file},
         {"_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm",[](Registers r)->uint64_t{uint64_t count=0;uint64_t args[]={reinterpret_cast<uint64_t>(&count),r[0],r[1],r[2],r[3]};auto result=read_file(args);return result?result:count==r[3]?0:IoError;}},
+        // SDK 5.4.0.0 appended `const ReadOption&` to both ReadFile overloads.
+        // The five leading arguments did not move, so the same body answers it.
+        // Leaving these unmatched is not a quiet fallback: the guest then runs
+        // nn::fs's own implementation, which resolves the host's stand-in
+        // FileHandle through fsa and dereferences the null it finds (measured on
+        // Dragon Quest Builders, sdk+0x56ab4 reading LINKDATA.BIN).
+        {"_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE",read_file},
+        {"_ZN2nn2fs8ReadFileENS0_10FileHandleElPvmRKNS0_10ReadOptionE",[](Registers r)->uint64_t{uint64_t count=0;uint64_t args[]={reinterpret_cast<uint64_t>(&count),r[0],r[1],r[2],r[3]};auto result=read_file(args);return result?result:count==r[3]?0:IoError;}},
         {"_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE",[](Registers r)->uint64_t{std::lock_guard lock(filesystem_mutex);struct stat st{};if(fstat(fd(r[1]),&st))return error();*ptr<int64_t>(r[0])=st.st_size;return 0;}},
         {"_ZN2nn2fs9CloseFileENS0_10FileHandleE",[](Registers r)->uint64_t{std::lock_guard lock(filesystem_mutex);auto it=files.find(r[0]);if(it==files.end())return IoError;
             // Commit may follow CloseFile; sync writable content before losing

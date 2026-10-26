@@ -16,10 +16,10 @@ PKG=${2:-}
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORKSPACE=$(cd "$ROOT/.." && pwd)
-BUILD=$WORKSPACE/s2a-work/android-build
-ADB=${ADB:-/tmp/pt/platform-tools/adb}
-export ADB_MDNS=0
-export JAVA_HOME=${JAVA_HOME:-/Users/miyue/tools/jdk/Contents/Home}
+BUILD=${S2A_BUILD_DIR:-$WORKSPACE/s2a-work/android-build}
+ADB=${ADB:-$(command -v adb || echo /tmp/pt/platform-tools/adb)}
+export ADB_MDNS=${ADB_MDNS:-0}  # mDNS 序列号需要设为 1
+export JAVA_HOME=${JAVA_HOME:-$HOME/.cmfa-toolchain/jdk}
 export ANDROID_HOME=${ANDROID_HOME:-/Users/miyue/.cmfa-toolchain/android-sdk}
 
 echo "== compiling native host"
@@ -54,4 +54,4 @@ echo "   on device: $("$ADB" -s "$SERIAL" shell "run-as $PKG stat -c %s files/na
 echo "== starting"
 "$ADB" -s "$SERIAL" shell am start -n "$PKG/dev.ot2.port.LauncherActivity" >/dev/null
 sleep 6
-"$ADB" -s "$SERIAL" logcat -d 2>/dev/null | grep "OT2Native" | tail -1
+"$ADB" -s "$SERIAL" logcat -d 2>/dev/null | grep -E "OT2Native|OT2Guest" | tail -6

@@ -1,0 +1,11 @@
+{
+  "title_id": "01001c500e72e000",
+  "name": "Dragon Quest Builders",
+  "status": "bring-up",
+  "versions": [0],
+  "main_build_ids": [
+    "a319e4ebeee02b0cfb89bfd14d8d1be100000000000000000000000000000000"
+  ],
+  "resource_adapter": "generic",
+  "default_fps": 30
+}

@@ -884,15 +884,23 @@ void install_service_initializers(const ot2::LoadedGame& game) {
         "_ZN2nn3err26InitializeContextWriterApiEv", "_ZN2nn2fs24InitializeForApplicationEv",
         "_ZN2nn4pctl10InitializeEv", "_ZN2nn4diag34InitializeApplicationAbortObserverEv"
     };
+    // SDK versions differ in which of these exports exist: 5.4.0.0 has no
+    // nndiagStartup at all, newer SDKs do. Each name is an IPC client this host
+    // replaces, so an absent one is a version difference rather than a missing
+    // capability -- gate the ones that are present and name the ones that are
+    // not, instead of refusing to start on a title that simply predates a symbol.
+    unsigned gated=0;
     for(const auto* name:names) {
         const auto address=game.symbol(name);
-        if(!address) fail("Service initialization export absent");
+        if(!address){log("SERVICE_INIT absent %s",name);continue;}
         uint32_t original;memcpy(&original,reinterpret_cast<void*>(address),4);
-        if(patch_system(address,original,first_island,name))continue;
+        if(patch_system(address,original,first_island,name)){++gated;continue;}
         traps.push_back({address,original,name});
         const uint32_t brk=0xd4200000 | (0x703<<5);
         memcpy(reinterpret_cast<void*>(address),&brk,4);
+        ++gated;
     }
+    if(!gated)fail("Service initialization export absent");
     // The compatibility set is optional by design: a title whose SDK never
     // reaches the service manager does not import these symbols, and one that
     // does needs every one of them answered. Report which half of that holds so
@@ -2061,6 +2069,33 @@ extern "C" void ot2_signal_handler(int sig,siginfo_t* info,void* raw) {
             if(record->magic==ESR_MAGIC&&record->size>=sizeof(esr_context))log("FAULT_ESR value=%llx",(unsigned long long)reinterpret_cast<const esr_context*>(record)->esr);
             offset+=record->size;
         }
+        // A null dereference names the pointer that was null but never the object
+        // that was supposed to hold it: by the time the faulting `ldr x8,[x0]`
+        // runs, the only surviving evidence is the callee-saved registers of the
+        // frame that made the call. Dump the qwords around them and around sp so
+        // the owning structure can be read out of one log group instead of a
+        // debugger session. guest_memory.inc is the only place that may be
+        // touched here, because reading an unmapped guest address would fault
+        // again inside the handler.
+        auto probe=[&](const char* name,uintptr_t base) {
+            if(!base || !(memory_permission_at(base)&PROT_READ)) return;
+            log("FAULT_OBJ %s=%#llx",name,(unsigned long long)base);
+            for(unsigned i=0;i<32;i+=4) {
+                const auto at=base+i*8;
+                if(!(memory_permission_at(at)&PROT_READ) || !(memory_permission_at(at+24)&PROT_READ)) break;
+                const auto* q=reinterpret_cast<const uintptr_t*>(at);
+                log("  +%#04x: %#llx %#llx %#llx %#llx",i*8,
+                    (unsigned long long)q[0],(unsigned long long)q[1],
+                    (unsigned long long)q[2],(unsigned long long)q[3]);
+            }
+        };
+        probe("x1",uc->uc_mcontext.regs[1]);
+        probe("x2",uc->uc_mcontext.regs[2]);
+        probe("x19",uc->uc_mcontext.regs[19]);
+        probe("x20",uc->uc_mcontext.regs[20]);
+        probe("x21",uc->uc_mcontext.regs[21]);
+        probe("sp",uc->uc_mcontext.sp);
+        if(trace_services.load(std::memory_order_relaxed)) dump_service_trace();
         fail(c?"Guest fault":"Signal outside guest thread",uc);
     }
     if(!c) fail("Signal outside guest thread",uc);
@@ -2226,6 +2261,12 @@ void boot_game(const std::string& directory,const std::string& log_path,uint64_t
     diagnostic_svc_enabled=std::filesystem::exists(std::filesystem::path(log_path).parent_path()/"diagnostic-svc");
     if(diagnostic_svc_enabled)log("DIAG diagnostic SVC mode: unimplemented calls are reported and continued");
     watchdog_log_directory=std::filesystem::path(log_path).parent_path().string();
+    // The service-call ring is normally armed by the watchdog, which first looks
+    // for the `trace-services` marker two seconds in. A title that faults while
+    // booting never reaches that tick, and a boot fault is exactly when the last
+    // few host calls decide everything -- so honour the marker here too.
+    if(std::filesystem::exists(std::filesystem::path(watchdog_log_directory)/"trace-services"))
+        trace_services.store(true,std::memory_order_relaxed);
     auto user_path=(std::filesystem::path(log_path).parent_path()/"userdata").string();
     std::filesystem::create_directories(user_path);
     vkhost_configure_package((std::filesystem::path(log_path).parent_path()/"shaders").c_str(),(std::filesystem::path(directory).parent_path().parent_path()/"shaders").c_str());

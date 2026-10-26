@@ -4819,6 +4819,30 @@ extern "C" void xbg_legacy_finish(){gfx_drain();std::lock_guard<std::recursive_m
 #if XBG_CPU_MERGE_TEST
 #include "../tests/cpu_image_merge.h"
 #endif
+// ---- 帧率标定（纯诊断，不改变默认行为）------------------------------------
+// 把呈现节拍人为延后到目标帧率，用来测量 guest 的逻辑推进速度是否等于 fps/60。
+// 标记 gfx-fps-cap 的内容就是目标 fps（10..240）；文件不存在时 period 保持 0，
+// 本函数立即返回，行为与未打补丁时完全一致。每 60 次呈现重读一次标记，因此可以在
+// 同一局游戏里切换档位。延后发生在 guest 的呈现调用上，等价于“让游戏更早遇到
+// vsync 上限”，不会改动任何游戏状态。
+static void fps_cap_wait(){
+    static uint64_t period=0,next=0;
+    static unsigned tick=0;
+    if((tick++%60)==0){
+        int fps=0;const char *base=marker_dir();
+        if(base[0]){
+            FILE *f=fopen((std::string(base)+"/gfx-fps-cap").c_str(),"rb");
+            if(f){int v=0;if(fscanf(f,"%d",&v)==1&&v>=10&&v<=240)fps=v;fclose(f);}
+        }
+        const uint64_t p=fps?uint64_t(1000000000ull/uint64_t(fps)):0;
+        if(p!=period){period=p;next=0;xbg_logf("NVN PACER fps_cap=%d period_us=%llu",fps,(unsigned long long)(p/1000));}
+    }
+    if(!period){next=0;return;}
+    const uint64_t now=timing_clock();
+    if(!next||now>next+period)next=now;
+    else std::this_thread::sleep_for(std::chrono::nanoseconds(next-now));
+    next+=period;
+}
 static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();flush_clears();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");
 #if XBG_CPU_MERGE_TEST
 cpu_image_merge_test();
@@ -4864,6 +4888,7 @@ extern "C" void xbg_submit(int n,const uint64_t *handles){
     std::vector<uint64_t> list(handles,handles+n);++gfx_enqueued;
     gfx_enqueue([list]{xbg_submit_now(int(list.size()),list.data());gfx_executed.store(submitted);});}
 extern "C" void xbg_present_texture(const win_t *window,const tex_t *texture){
+    fps_cap_wait();
     if(!gfx_async){xbg_present_texture_now(window,texture);return;}
     // At most two frames queued ahead of the graphics thread.
     {uint64_t t0=uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());std::unique_lock<std::mutex> l(gfx_job_mutex);gfx_idle_cv.wait(l,[]{return gfx_presents_queued.load()<2;});gfx_pace_ns+=uint64_t(std::chrono::steady_clock::now().time_since_epoch().count())-t0;}

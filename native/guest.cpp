@@ -28,6 +28,7 @@
 #include <stdexcept>
 #include <sys/mman.h>
 #include <sys/random.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -2062,6 +2063,71 @@ extern "C" void ot2_signal_handler(int sig,siginfo_t* info,void* raw) {
             log("FAULT_STACK perms sp=%#x page=%#x addr=%#x",
                 memory_permission_at(sp),memory_permission_at(sp&~uintptr_t(4095)),
                 memory_permission_at(reinterpret_cast<uintptr_t>(info->si_addr)));
+            // 故障地址落在哪一段 mapping、以及内存里真实的指令编码。
+            // 只看模块文件会误导：加载期 TLS 重写会把 mrs/msr 换成 `b island`，
+            // 文件里那条指令和真正执行的不是同一条。这里两样都打出来。
+            {
+                // /proc/self/maps 里的归属。用固定缓冲区、只 read/sscanf，
+                // 避免在信号处理里分配内存而撞上 malloc 锁。
+                static char maps[256*1024];
+                const int fd=open("/proc/self/maps",O_RDONLY);
+                if(fd>=0){
+                    ssize_t total=0;
+                    while(total<int(sizeof(maps))-1){
+                        const ssize_t n=read(fd,maps+total,size_t(int(sizeof(maps))-1-total));
+                        if(n<=0)break;
+                        total+=n;
+                    }
+                    close(fd);maps[total]=0;
+                    const auto report=[&](const char* tag,uintptr_t address){
+                        unsigned long long lo=0,hi=0;char perms[8]={};
+                        unsigned long long below_lo=0,below_hi=0;char below[192]={};
+                        for(const char* at=maps;at&&*at;){
+                            const char* line_end=strchr(at,'\n');
+                            const size_t length=line_end?size_t(line_end-at):strlen(at);
+                            if(sscanf(at,"%llx-%llx %7s",&lo,&hi,perms)==3){
+                                if(address>=lo&&address<hi){
+                                    char line[192]={};
+                                    const auto take=std::min(length,sizeof(line)-1);
+                                    memcpy(line,at,take);
+                                    log("FAULT_MAP %s=%#llx IN %s",tag,(unsigned long long)address,line);
+                                    return;
+                                }
+                                if(hi<=address&&hi>=below_hi){
+                                    below_hi=hi;below_lo=lo;
+                                    const auto take=std::min(length,sizeof(below)-1);
+                                    memcpy(below,at,take);
+                                }
+                            }
+                            if(!line_end)break;
+                            at=line_end+1;
+                        }
+                        log("FAULT_MAP %s=%#llx NOT_MAPPED below=[%#llx,%#llx) %s",tag,
+                            (unsigned long long)address,(unsigned long long)below_lo,
+                            (unsigned long long)below_hi,below);
+                    };
+                    report("fault",reinterpret_cast<uintptr_t>(info->si_addr));
+                    report("sp",sp);
+                    report("pc",uc->uc_mcontext.pc);
+                }
+                // 内存里的真实指令。process_vm_readv 读不到会返回错误，
+                // 不会在故障处理里再触发一次 SIGSEGV。
+                uint64_t words[16]{};
+                const auto pc=uc->uc_mcontext.pc;
+                struct iovec local{words,sizeof(words)};
+                struct iovec remote{reinterpret_cast<void*>(pc-32),sizeof(words)};
+                const auto got=process_vm_readv(getpid(),&local,1,&remote,1,0);
+                if(got>0){
+                    log("FAULT_CODE pc=%#llx words_before_after:",(unsigned long long)pc);
+                    for(unsigned i=0;i<got/8;i+=4)
+                        log("  pc%+#06x: %08llx %08llx %08llx %08llx",
+                            int(i*8)-32,
+                            (unsigned long long)(words[i]&0xffffffffu),(unsigned long long)(words[i+1]&0xffffffffu),
+                            (unsigned long long)(words[i+2]&0xffffffffu),(unsigned long long)(words[i+3]&0xffffffffu));
+                }else{
+                    log("FAULT_CODE pc=%#llx unreadable (%lld)",(unsigned long long)pc,(long long)got);
+                }
+            }
         }
         size_t offset=0;while(offset+sizeof(_aarch64_ctx)<=sizeof(uc->uc_mcontext.__reserved)){
             auto* record=reinterpret_cast<const _aarch64_ctx*>(uc->uc_mcontext.__reserved+offset);

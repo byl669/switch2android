@@ -4039,9 +4039,26 @@ void clear_attachment(const p_clear_color *color,const p_clear_ds *depth,int sca
         if(cm)a.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;a.colorAttachment=color->index;memcpy(&a.clearValue.color,color->rgba,16);partial=cm && cm!=15;
     }else{
         need(state.rt.depth,"Clear depth attachment missing");sm=uint32_t(depth->stencil_mask)&255;
-        VkImageAspectFlags requested=(depth->depth_mask?VK_IMAGE_ASPECT_DEPTH_BIT:0)|(sm?VK_IMAGE_ASPECT_STENCIL_BIT:0);need((aspect(state.rt.depth->d.format)&requested)==requested,"Clear requests absent depth/stencil aspect");
-        if(depth->depth_mask){need(depth->depth>=0 && depth->depth<=1,"Depth clear value outside normalized range");a.aspectMask|=VK_IMAGE_ASPECT_DEPTH_BIT;}
-        partial=sm && sm!=255;if(sm && !partial)a.aspectMask|=VK_IMAGE_ASPECT_STENCIL_BIT;a.clearValue.depthStencil={depth->depth,uint32_t(depth->stencil)&255};
+        // 硬件上"清一个附件根本没有的 aspect"就是没有这一步。DEPTH16/DEPTH24/DEPTH32F
+        // 目标里没有模板位，可游戏常按 D24S8 的习惯无脑传 stencilMask=0xFF（本作就这样）。
+        // 以前这里直接 abort —— 那就是随机闪退的元凶（2026-10-27 平板自动点击复现定位）。
+        // A clear of an aspect the attachment does not have is a no-op on hardware: DEPTH16/
+        // DEPTH24/DEPTH32F targets carry no stencil bits, yet games routinely pass
+        // stencilMask=0xFF as if every target were D24S8. This used to abort the process.
+        VkImageAspectFlags requested=(depth->depth_mask?VK_IMAGE_ASPECT_DEPTH_BIT:0)|(sm?VK_IMAGE_ASPECT_STENCIL_BIT:0);
+        const VkImageAspectFlags have=aspect(state.rt.depth->d.format),absent=requested&~have;
+        if(absent){
+            static unsigned notes=0;if(notes++<16)xbg_logf("NVN clear aspect absent nvn=%#x have=%#x requested=%#x depth_mask=%u stencil_mask=%#x depth=%g stencil=%u drop=%#x",
+                state.rt.depth->d.format,unsigned(have),unsigned(requested),depth->depth_mask?1u:0u,sm,depth->depth,unsigned(depth->stencil),unsigned(absent));
+            requested&=have;if(!(requested&VK_IMAGE_ASPECT_STENCIL_BIT))sm=0;
+        }
+        // vkCmdClearAttachments 的深度清屏值超出 [0,1] 是未定义行为，夹进合法区间而不是退出。
+        float cleared_depth=depth->depth;
+        if(depth->depth_mask){
+            if(!(cleared_depth>=0.0f && cleared_depth<=1.0f)){static unsigned notes=0;if(notes++<8)xbg_logf("NVN depth clear value clamped %g",double(cleared_depth));cleared_depth=cleared_depth<0.0f?0.0f:1.0f;}
+            if(requested&VK_IMAGE_ASPECT_DEPTH_BIT)a.aspectMask|=VK_IMAGE_ASPECT_DEPTH_BIT;
+        }
+        partial=sm && sm!=255;if(sm && !partial)a.aspectMask|=VK_IMAGE_ASPECT_STENCIL_BIT;a.clearValue.depthStencil={cleared_depth,uint32_t(depth->stencil)&255};
     }
     if(!a.aspectMask && !partial)return;
     // Full (unmasked) clears are recorded inside the draw render pass of the
@@ -4349,7 +4366,8 @@ void clear_texture(const p_clear_tex &input){preflight_cpu_reads();
 
     bool partial=p.mask!=15 || p.r.xoffset || p.r.yoffset || uint32_t(p.r.width)!=w || uint32_t(p.r.height)!=h;
     if(partial)need(im.source.d.target!=2,"Partial 3D texture clear requires 2D slice-view support");
-    if(im.aspects&VK_IMAGE_ASPECT_DEPTH_BIT)need(p.c.f[0]>=0 && p.c.f[0]<=1,"Texture depth clear outside normalized range");
+    // 深度清屏值超范围在 Vulkan 里是未定义行为，夹到合法区间继续，不退出进程。
+    if((im.aspects&VK_IMAGE_ASPECT_DEPTH_BIT) && !(p.c.f[0]>=0.0f && p.c.f[0]<=1.0f)){static unsigned notes=0;if(notes++<8)xbg_logf("NVN texture depth clear value clamped %g",double(p.c.f[0]));p.c.f[0]=p.c.f[0]<0.0f?0.0f:1.0f;}
     if(partial || im.levels>1 || im.layers>1){need(im.samples==VK_SAMPLE_COUNT_1_BIT || im.gpu_written,"Partial clear of uninitialized CPU multisample storage unsupported");get_image(p.tex,true);}
     if(partial){partial_clear_texture(im,p,level,layer,scalar);return;}
     bool volume=im.source.d.target==2;need(!volume || (p.r.zoffset==0 && uint32_t(p.r.depth)==std::max(1u,im.depth>>level)),"Partial volume clear requires shader clear");

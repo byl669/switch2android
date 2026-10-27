@@ -220,6 +220,11 @@ bool draw_trace=false,draw_skip_active=false,draw_skip_list=false;unsigned draw_
 constexpr unsigned draw_skip_words=8;
 uint64_t draw_skip_mask[draw_skip_words]={};
 bool dump_draw_active=false;unsigned dump_draw_index=0;
+// gfx-ubo-full 里写 draw 序号（逗号分隔）时，把这些 draw 的整个顶点级 uniform 块原样打出来。
+// 屏幕位置不由顶点属性决定（这个标题的顶点流里没有位置，pos=[none]），而是靠 uniform 里的模型矩阵，
+// 所以"这个 draw 画在屏幕哪里"只能从 uniform 内容回答；只读前 4 个 float 拿到的是投影，全都一样。
+bool ubo_full_active=false;uint64_t ubo_full_mask[8]={};
+bool ubo_full_wanted(unsigned i){return ubo_full_active && i<512 && (ubo_full_mask[i>>6]>>(i&63)&1);}
 // gfx-cull-none makes every draw's pipeline rasterise both faces. It separates the two
 // explanations for "the geometry submitted and painted nothing": the triangles are outside
 // the viewport, or they are inside it and wound the wrong way. The draw path flips Y through a
@@ -341,6 +346,22 @@ void read_draw_probe(){
     }
     draw_skip_active=false;
     for(uint64_t word:draw_skip_mask)if(word)draw_skip_active=true;
+    for(uint64_t &word:ubo_full_mask)word=0;
+    if(base[0])if(FILE *f=fopen((std::string(base)+"/gfx-ubo-full").c_str(),"rb")){
+        char line[256]={0};
+        if(fgets(line,sizeof line,f)){
+            for(const char *p=line;*p;){
+                while(*p==' '||*p=='\t'||*p==','||*p=='\r'||*p=='\n')++p;
+                if(*p<'0'||*p>'9')break;
+                unsigned v=0;while(*p>='0'&&*p<='9'){v=v*10+unsigned(*p-'0');++p;}
+                if(v<512)ubo_full_mask[v>>6]|=1ull<<(v&63);
+                else xbg_logf("DRAW_UBO gfx-ubo-full index %u out of range (0-511); ignored",v);
+            }
+        }
+        fclose(f);
+    }
+    ubo_full_active=false;
+    for(uint64_t word:ubo_full_mask)if(word)ubo_full_active=true;
     dump_draw_active=false;dump_draw_index=0;
     if(base[0])if(FILE *f=fopen((std::string(base)+"/gfx-dump-draw").c_str(),"rb")){
         unsigned mb=0;int parsed=fscanf(f,"%u %u",&dump_draw_index,&mb);
@@ -3608,15 +3629,15 @@ bool ui_cover_all(double hf){
 void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0){if(skip_render_frame.load(std::memory_order_relaxed))return;need(nx_vk_depth_zero,"[RED] Negative-one depth requires a shader variant");need(!nx_vk_origin_ll,"[RED] Lower-left origin requires a viewport variant");// [d2r-integration] Conditional render / render-enable, decided on the CPU just
 // before the draw. Both counters zero means the query has not reported yet; the
 // draw then goes through, so such a title renders more than it should, never less.
-if(!state.render_enable)return;
+if(!state.render_enable){if(draw_trace)xbg_logf("DRAW_DROP reason=render_enable prim=%d count=%d ps=%s",prim,count,state.shader[4]?state.shader[4]->key.c_str():"none");return;}
 // [d2r-integration] A stage whose bundle was unavailable has no module; the
 // pipeline cannot be built for it, so the draw is dropped rather than aborting.
-for(unsigned st=0;st<5;st++)if(state.shader[st] && state.shader[st]->missing)return;
+for(unsigned st=0;st<5;st++)if(state.shader[st] && state.shader[st]->missing){if(draw_trace)xbg_logf("DRAW_DROP reason=shader_missing stage=%u ps=%s",st,state.shader[4]?state.shader[4]->key.c_str():"none");return;}
 if(state.render_cond_mode>=0){
-    if(!state.render_cond_addr)return;                              // no storage named: nothing can pass
+    if(!state.render_cond_addr){if(draw_trace)xbg_logf("DRAW_DROP reason=cond_no_addr ps=%s",state.shader[4]?state.shader[4]->key.c_str():"none");return;}   // no storage named: nothing can pass
     const auto *cond=reinterpret_cast<const uint64_t*>(state.render_cond_addr);
     const uint64_t before=cond[0],after=cond[2];                   // counter fields, stride sizeof(NVNcounterData)
-    if(before||after){const bool equal=before==after;if(!(state.render_cond_mode==0?equal:!equal))return;}
+    if(before||after){const bool equal=before==after;if(!(state.render_cond_mode==0?equal:!equal)){if(draw_trace)xbg_logf("DRAW_DROP reason=cond mode=%d before=%llu after=%llu ps=%s",state.render_cond_mode,(unsigned long long)before,(unsigned long long)after,state.shader[4]?state.shader[4]->key.c_str():"none");return;}}
     else{static std::atomic<unsigned> reported{0};if(reported.fetch_add(1,std::memory_order_relaxed)<4)
         xbg_logf("NVN conditional render undecided at %#llx (both counters zero); drawing",(unsigned long long)state.render_cond_addr);}
 }
@@ -3626,7 +3647,7 @@ preflight_cpu_reads();CPU_SCOPE(Draw);DrawRoot draw_timing_root(&cpu_scope);prov
     uint32_t active_colors=0;for(int i=0;i<state.rt.n;i++)if(state.rt.color[i])active_colors|=1u<<i;
     static std::vector<VkPipelineShaderStageCreateInfo> stages;stages.assign(5,VkPipelineShaderStageCreateInfo{});uint32_t stage_count=0;   // draw(): graphics thread only, not re-entrant
     int stage_result=xbg_graphics_stages(modules,state.rt.depth!=nullptr,active_colors,state.mask.mask,state.ms.a2c,stages.data(),&stage_count);
-    if(stage_result)xbg_fatalf("Invalid graphics stage/depth-only state: %d",stage_result);stages.resize(stage_count);need(count>=0 && first>=0,"Negative draw range");if(!count || (indexed && indexed->instances==0))return;provenance_draw();
+    if(stage_result)xbg_fatalf("Invalid graphics stage/depth-only state: %d",stage_result);stages.resize(stage_count);need(count>=0 && first>=0,"Negative draw range");if(!count || (indexed && indexed->instances==0)){if(draw_trace)xbg_logf("DRAW_DROP reason=empty prim=%d count=%d ps=%s",prim,count,state.shader[4]?state.shader[4]->key.c_str():"none");return;}provenance_draw();
     const int orig_count=count;std::vector<uint32_t> quad_indices;p_draw_idx quad_indexed{};
     if(prim==7 && !indexed){
         need(instances<=INT32_MAX && first_instance<=INT32_MAX,"Quad instance range exceeds backend limits");
@@ -3842,6 +3863,55 @@ preflight_cpu_reads();CPU_SCOPE(Draw);DrawRoot draw_timing_root(&cpu_scope);prov
         }
         xbg_logf("TEXSLOTS f=%llu i=%u prim=%d count=%d att=[%d]",
             (unsigned long long)stats.presents.load(),probe_no,prim,count,state.rt.n);
+    }
+    if(draw_trace){auto v0=state.vb[0];
+        // Every bound uniform buffer of the vertex stage, not just slot 0. Slot 0 is the
+        // projection/scale matrix on this title (m0=2/1280, m5=-2/720) and is identical for every
+        // draw, so reading it alone cannot answer "where on screen is this quad". The per-draw
+        // model matrix is a later slot; print the first row and translation of each bound slot so
+        // the draw's screen position can be reconstructed offline.
+        char ubs[448];int ui=0;ubs[0]=0;
+        for(unsigned sl=0;sl<16;sl++){
+            auto u=state.ub[0][sl];
+            if(!u.address||u.size<16)continue;
+            float m[16]={0};
+            memcpy(m,(const void*)u.address,u.size<64?size_t(u.size):size_t(64));
+            ui+=snprintf(ubs+ui,sizeof(ubs)-size_t(ui),"%s%u/%u:[%.3f %.3f %.3f %.3f]",
+                ui?" ":"",sl,unsigned(u.size),double(m[0]),double(m[5]),double(m[12]),double(m[13]));
+            if(ui>=int(sizeof(ubs))-64)break;
+        }
+        if(!ui)snprintf(ubs,sizeof(ubs),"none");
+        char vsm[96]="none";
+        if(v0.address&&v0.size>=16){float f[4];memcpy(f,(const void*)v0.address,16);
+            snprintf(vsm,sizeof(vsm),"%.3f,%.3f,%.3f,%.3f",double(f[0]),double(f[1]),double(f[2]),double(f[3]));}
+        xbg_logf("DRAW_UBO i=%u vb=%p vbsize=%llu stride=%u v0=[%s] ubos=[%s]",probe_no,(void*)v0.address,
+            (unsigned long long)v0.size,unsigned(state.stream[0].stride),vsm,ubs);
+        if(ubo_full_wanted(probe_no)){
+            // Raw dump of the vertex-stage uniform block that carries the transform. Off unless
+            // named in gfx-ubo-full because it is 140 floats a draw. The whole block, not the first
+            // 160 bytes: the first 16 floats are the orthographic projection (2/1280, 2/720) and the
+            // sprite position lives past them, in the per-draw tail.
+            for(unsigned sl=0;sl<3;sl++){
+                auto u=state.ub[0][sl];
+                if(!u.address||u.size<16)continue;
+                unsigned n=unsigned(u.size/4);if(n>140)n=140;
+                char raw[640];int ri=0;raw[0]=0;
+                for(unsigned k=0;k<n && ri<int(sizeof(raw))-12;k++){
+                    float v=0;memcpy(&v,(const char*)u.address+k*4,4);
+                    ri+=snprintf(raw+ri,sizeof(raw)-size_t(ri),"%s%.4g",k?",":"",double(v));
+                }
+                xbg_logf("UBO_FULL i=%u slot=%u bytes=%u f=[%s]",probe_no,sl,unsigned(u.size),raw);
+            }
+            // Vertex bytes too: pos=[none] says the shader takes no position attribute, so the quad
+            // corners must be either here or in the uniform tail. Both have to be on the record to
+            // tell which, and only for the draws named in the marker.
+            if(v0.address&&v0.size>=64){
+                char vraw[320];int vi=0;vraw[0]=0;
+                for(unsigned k=0;k<16;k++){float v=0;memcpy(&v,(const char*)v0.address+k*4,4);
+                    vi+=snprintf(vraw+vi,sizeof(vraw)-size_t(vi),"%s%.4g",k?",":"",double(v));}
+                xbg_logf("VB_FULL i=%u stride=%u bytes=[%s]",probe_no,unsigned(state.stream[0].stride),vraw);
+            }
+        }
     }
     if(draw_trace && probe_no<draw_trace_limit){
         char textures[224];int at=0;textures[0]=0;
@@ -4291,6 +4361,11 @@ void copy_texture(const p_copy_t2t &p){preflight_cpu_reads();Image &s=get_image(
     need(!(s.fmt>=VK_FORMAT_ASTC_4x4_UNORM_BLOCK && s.fmt<=VK_FORMAT_ASTC_12x12_SRGB_BLOCK && d.source.d.format>=0x41 && d.source.d.format<=0x50 && !d.decoded),"ASTC blocks into a native BC texture: the ASTC pack needs decoded BC (marker gfx-native-bc = 0)");
     if(s.decoded || d.decoded)need(s.decoded && d.decoded && xbg_bc_view_compatible(s.source.d.format,d.source.d.format),"BC texture copy must retain compression and signedness");
     const bool copy_ok=(uint32_t(p.flags)&~3u)==0 && s.fmt==d.fmt && s.aspects==d.aspects && s.samples==d.samples;
+    // 跨格式拷贝：NVN 允许把渲染目标按另一种格式拷进纹理，本作每局就这么干 —— 把 RGBA16F 的
+    // HDR 画面拷进 RGB(A)8 的 UI 合成层（本作 serial 180 -> 10265）。以前这里在默认 mode=1 下
+    // 直接 return，目标纹理就永远停在初始的全零内容，旋转剪影的参考图整块空白就是这么丢的。
+    // 同尺寸的单采样纯颜色 2D 拷贝交给 vkCmdBlitImage 去做格式转换；其余组合照旧丢弃。
+    bool convert_blit=false;
     if(!copy_ok){
         // A format mismatch is either the game genuinely asking for a conversion or our get_image() handing
         // back an Image that no longer matches the live texture object. objfmt is the descriptor on the texture
@@ -4303,20 +4378,33 @@ void copy_texture(const p_copy_t2t &p){preflight_cpu_reads();Image &s=get_image(
             (unsigned long long)p.dst->serial,p.dst->d.format,d.source.d.format,d.fmt,d.aspects,d.samples,d.width,d.height,d.depth,d.layers,d.levels,int(d.decoded),uint32_t(d.usage),(long long)d.mem_bytes,
             uint32_t(p.flags),p.sr.xoffset,p.sr.yoffset,p.sr.zoffset,p.sr.width,p.sr.height,p.sr.depth,
             p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,int(p.has_sv),p.sv.base_level,p.sv.nlevels,int(p.has_dv),p.dv.base_level,p.dv.nlevels,fmt_copy_mode);
-        if(fmt_copy_mode==1)return;
         if(fmt_copy_mode==2){
             // Loud-colour probe: does anything ever read this destination?
             p_clear_tex fill{};fill.tex=p.dst;fill.has_view=1;fill.view=p.dv;fill.r=p.dr;fill.mask=15;fill.is_uint=0;
             fill.c.f[0]=1.0f;fill.c.f[1]=0.0f;fill.c.f[2]=1.0f;fill.c.f[3]=1.0f;
             clear_texture(fill);return;
         }
+        const bool size_ok=p.sr.width==p.dr.width && p.sr.height==p.dr.height;
+        convert_blit=fmt_copy_mode!=3 && size_ok && !s.decoded && !d.decoded
+            && s.aspects==VK_IMAGE_ASPECT_COLOR_BIT && d.aspects==VK_IMAGE_ASPECT_COLOR_BIT
+            && s.samples==VK_SAMPLE_COUNT_1_BIT && d.samples==VK_SAMPLE_COUNT_1_BIT
+            && s.source.d.target!=0 && s.source.d.target!=2 && s.source.d.target!=3
+            && d.source.d.target!=0 && d.source.d.target!=2 && d.source.d.target!=3
+            && s.view_format(p.has_sv?&p.sv:nullptr)==s.fmt && d.view_format(p.has_dv?&p.dv:nullptr)==d.fmt;
+        if(convert_blit){
+            static std::set<std::pair<uint64_t,uint64_t>> noted;
+            if(noted.insert({p.src->serial,p.dst->serial}).second)
+                xbg_logf("COPYCONVERT src=%llu %#x %dx%d -> dst=%llu %#x via blit (gfx-fmt-copy-skip=3 disables)",
+                    (unsigned long long)p.src->serial,s.source.d.format,int(s.width),int(s.height),
+                    (unsigned long long)p.dst->serial,d.source.d.format);
+        } else return;
     }
-    need(copy_ok,"Texture copy requires matching formats/aspects and supported flags");
+    need(copy_ok || convert_blit,"Texture copy requires matching formats/aspects and supported flags");
     uint32_t sl=p.has_sv&&p.sv.set_levels?p.sv.base_level:0,dl=p.has_dv&&p.dv.set_levels?p.dv.base_level:0,sa=p.has_sv&&p.sv.set_layers?p.sv.min_layer:0,da=p.has_dv&&p.dv.set_layers?p.dv.min_layer:0;
     region_check(s,sl,sa,p.sr);region_check(d,dl,da,p.dr);need(&s!=&d,"Same-image copy needs overlap validation");need((s.source.d.target==2)==(d.source.d.target==2),"Mixed volume/array copy requires slice mapping");
     bool scaled=p.sr.width!=p.dr.width || p.sr.height!=p.dr.height || p.sr.depth!=p.dr.depth;
     VkImageBlit blit{};VkFilter filter{};
-    if(scaled){
+    if(scaled || convert_blit){
         need(!s.decoded && !d.decoded && s.source.d.target!=0 && s.source.d.target!=2 && s.source.d.target!=3 && d.source.d.target!=0 && d.source.d.target!=2 && d.source.d.target!=3 && s.aspects==VK_IMAGE_ASPECT_COLOR_BIT && s.samples==VK_SAMPLE_COUNT_1_BIT,"Scaled blit requires native single-sample color 2D/array images");
         need(s.view_format(p.has_sv?&p.sv:nullptr)==s.fmt && d.view_format(p.has_dv?&p.dv:nullptr)==d.fmt,"Scaled blit cannot reinterpret image views");
         VkFormatProperties sf{},df{};vkGetPhysicalDeviceFormatProperties(cfg.physical,s.fmt,&sf);vkGetPhysicalDeviceFormatProperties(cfg.physical,d.fmt,&df);
@@ -4328,7 +4416,7 @@ void copy_texture(const p_copy_t2t &p){preflight_cpu_reads();Image &s=get_image(
     // also preserves untouched mip levels and array layers for ordinary copies.
     bool full_destination=xbg_copy_is_full({d.width,d.height,d.source.d.target==2?d.depth:d.layers,d.levels,dl,da,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,p.dr.width,p.dr.height,p.dr.depth})!=0;
     if(!full_destination){need(d.samples==VK_SAMPLE_COUNT_1_BIT || d.gpu_written,"Partial copy into initial CPU multisample storage unsupported");get_image(p.dst,true);}
-    if(scaled){Commands c;s.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);d.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdBlitImage(c.command,s.image,s.layout,d.image,d.layout,1,&blit,filter);s.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);d.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();d.gpu_written=true,provenance_write(d,__LINE__);return;}
+    if(scaled || convert_blit){Commands c;s.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);d.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdBlitImage(c.command,s.image,s.layout,d.image,d.layout,1,&blit,filter);s.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);d.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();d.gpu_written=true,provenance_write(d,__LINE__);return;}
     Commands c;s.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);d.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);VkImageCopy r{};r.srcSubresource=copy_layers(s,sl,sa,p.sr);r.dstSubresource=copy_layers(d,dl,da,p.dr);r.srcOffset=copy_offset(s,p.sr);r.dstOffset=copy_offset(d,p.dr);r.extent=copy_extent(s,p.sr);std::vector<VkImageCopy> regions;
     for(VkImageAspectFlags flag: {VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT),VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT),VkImageAspectFlags(VK_IMAGE_ASPECT_STENCIL_BIT)})if(s.aspects&flag){auto one=r;one.srcSubresource.aspectMask=one.dstSubresource.aspectMask=flag;regions.push_back(one);}
     vkCmdCopyImage(c.command,s.image,s.layout,d.image,d.layout,regions.size(),regions.data());s.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);d.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();d.gpu_written=true,provenance_write(d,__LINE__);}

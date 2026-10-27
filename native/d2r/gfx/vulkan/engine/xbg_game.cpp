@@ -3428,8 +3428,13 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
     for(unsigned i=0;i<9;i++)if(targets[i]){
         const tex_t &t=*targets[i];const view_t *v=selected[i];
         need(t.magic==MAGIC('T','E','X',0) && t.serial,"Invalid NVN render attachment");
+        // 渲染目标一次只覆盖一层：帧缓冲只是 2D 的，多层纹理也只画 view 的起始层。
+        // A render target covers a single layer: a framebuffer is 2D, so a layered texture contributes only its
+        // view's base layer.
+        if(v && v->set_layers)need(uint32_t(v->min_layer)<t.L.layers && uint32_t(v->nlayers) && uint32_t(v->min_layer)+uint32_t(v->nlayers)<=t.L.layers,"Render target view layers outside texture");
+        const uint32_t rt_layers=1u;
         extents[i]={1,t.d.width,t.d.height,t.d.levels,t.L.layers,v&&v->set_levels?uint32_t(v->base_level):0,v&&v->set_levels?uint32_t(v->nlevels):t.d.levels,
-            v&&v->set_layers?uint32_t(v->min_layer):0,v&&v->set_layers?uint32_t(v->nlayers):t.L.layers,uint32_t(std::max(1,t.d.samples))};
+            v&&v->set_layers?uint32_t(v->min_layer):0,rt_layers,uint32_t(std::max(1,t.d.samples))};
         trace=(trace^t.serial^uint64_t(i)) * 1099511628211ull;trace^=hash_memory(&extents[i],sizeof(extents[i]));
         trace^=uint64_t(v&&v->set_format?v->format:t.d.format)<<32;
     }
@@ -3449,10 +3454,23 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
     for(unsigned slot=0;slot<9;slot++)if(targets[slot]){
         Image &im=get_image(targets[slot],false);const view_t *view=selected[slot];
         need((slot==8)==(im.aspects!=VK_IMAGE_ASPECT_COLOR_BIT),"Color/depth attachment role mismatches texture aspects");
+        // 多层纹理当渲染目标时只画起始层。真实 NVN 的 framebuffer 就是 2D 的、一次只写一层，
+        // 但这里原先把层范围原样带进了 view：Image::view 的 need(ls==1) 与 xbg_framebuffer_plan
+        // 的 -3 分支都会拒绝它 ——「连接轨道」每局进游戏必定致命退出（1024x1024 D16 的 4 层 depth，
+        // 且游戏给它设的 view 本身就是 set_layers=1/nlayers=4，不是"没指定"）。
+        // A layered texture used as a render target draws its base layer only: a real NVN framebuffer is 2D and
+        // writes one layer, but the view's whole layer range used to be forwarded, which both Image::view's
+        // need(ls==1) and xbg_framebuffer_plan's -3 branch reject -- the crash on entering 连接轨道.
+        view_t single_view=view?*view:view_t{};const view_t *attach_view=view;
+        if(im.layers>1){
+            single_view.set_layers=1;single_view.min_layer=view&&view->set_layers?view->min_layer:0;single_view.nlayers=1;attach_view=&single_view;
+            static std::set<uint64_t> noted;
+            if(noted.insert(im.source.serial).second)xbg_logf("NVN layered render target serial=%llu layers=%u role=%s draws base layer %u",(unsigned long long)im.source.serial,im.layers,slot==8?"depth":"color",unsigned(single_view.min_layer));
+        }
         if(c.draw)prepare_attachment(im,c.command);else im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);VkAttachmentDescription a{};a.format=im.view_format(view);a.samples=im.samples;a.loadOp=VK_ATTACHMENT_LOAD_OP_LOAD;a.storeOp=VK_ATTACHMENT_STORE_OP_STORE;a.stencilLoadOp=VK_ATTACHMENT_LOAD_OP_LOAD;a.stencilStoreOp=VK_ATTACHMENT_STORE_OP_STORE;a.initialLayout=a.finalLayout=VK_IMAGE_LAYOUT_GENERAL;
         if(noload_all && im.aspects==VK_IMAGE_ASPECT_COLOR_BIT)a.loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         if(nostore_all && im.aspects==VK_IMAGE_ASPECT_COLOR_BIT)a.storeOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        uint32_t index=descriptions.size();descriptions.push_back(a);views.push_back(im.view(view,true));p.images.push_back(&im);im.gpu_written=true,provenance_write(im,__LINE__);
+        uint32_t index=descriptions.size();descriptions.push_back(a);views.push_back(im.view(attach_view,true));p.images.push_back(&im);im.gpu_written=true,provenance_write(im,__LINE__);
         if(slot==8)depth.attachment=index;else colors[slot].attachment=index;
     }
     p.color_slots=colors.size();VkSubpassDescription sub{};sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=colors.size();sub.pColorAttachments=colors.data();sub.pDepthStencilAttachment=depth.attachment!=VK_ATTACHMENT_UNUSED?&depth:nullptr;
@@ -4577,7 +4595,20 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
             complete_all();cpu_access(addr,4,10);snapshot_invalidate(addr,4);auto ptr=reinterpret_cast<uint32_t*>(addr);if(mode==NVN_EVENT_SIGNAL_MODE_ADD)__atomic_fetch_add(ptr,v,__ATOMIC_SEQ_CST);else{need(mode==NVN_EVENT_SIGNAL_MODE_WRITE,"Unknown event mode");__atomic_store_n(ptr,v,__ATOMIC_SEQ_CST);}break;}
         case OP_COPY_B2B:{need(n>=24,"Truncated buffer copy");uint64_t a[3];memcpy(a,p,24);need(a[0]&&a[1]&&a[2]<=256ull*1024*1024,"Invalid buffer copy");if(gpu_buffer_copy(a[0],a[1],a[2]))break;cpu_access(a[0],a[2],11);invalidate_cpu_range(a[1],a[2]);memmove(reinterpret_cast<void*>(a[1]),reinterpret_cast<void*>(a[0]),a[2]);break;}
         case OP_UPDATE_UB:{need(n>=16,"Truncated uniform update");uint64_t a[2];memcpy(a,p,16);need(a[0] && a[1]<=n-16,"Invalid uniform update");invalidate_cpu_range(a[0],a[1]);memcpy(reinterpret_cast<void*>(a[0]),p+16,a[1]);break;}
-        case OP_SET_RT:state.rt=payload<p_set_rt>(p,n);break;
+        case OP_SET_RT:{state.rt=payload<p_set_rt>(p,n);
+            // [diag] gfx-draw-trace 打开时，把每帧前若干次目标切换的原始 n/serial 打出来：3D 小游戏
+            // 的画面靠"先只写深度、再按深度相等补色"两遍，如果第二遍的 color 目标在 guest 侧就是空的，
+            // 只能从这里看出来。| With gfx-draw-trace on, log the raw n/serials of the first target switches:
+            // the 3D minigames render depth first and colour second, and only this shows whether the guest
+            // actually passed a colour target for the second pass.
+            static unsigned rt_notes=0;static p_set_rt rt_seen{};static bool rt_have=false;
+            if(draw_trace && rt_notes<500 && (!rt_have || rt_seen.n!=state.rt.n || rt_seen.depth!=state.rt.depth || memcmp(rt_seen.color,state.rt.color,sizeof(state.rt.color)))){
+                char colors[192];int ci=0;
+                for(int i=0;i<state.rt.n && i<8;i++)ci+=snprintf(colors+ci,sizeof(colors)-size_t(ci),"%s%llu",i?",":"",(unsigned long long)(state.rt.color[i]?state.rt.color[i]->serial:0));
+                if(!ci)snprintf(colors,sizeof(colors),"none");
+                xbg_logf("SET_RT n=%d colors=[%s] depth=%llu",state.rt.n,colors,(unsigned long long)(state.rt.depth?state.rt.depth->serial:0));
+                rt_seen=state.rt;rt_have=true;++rt_notes;}
+            break;}
         case OP_CLEAR_COLOR:{auto a=payload<p_clear_color>(p,n);clear_attachment(&a,nullptr);break;}
         case XBG_EXT_BASE+9:{auto a=payload<xbg_typed_clear>(p,n);clear_attachment(&a.color,nullptr,a.scalar);break;}
         case OP_CLEAR_DS:{auto a=payload<p_clear_ds>(p,n);clear_attachment(nullptr,&a);break;}

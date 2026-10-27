@@ -14,6 +14,8 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.InputDevice;
 import android.hardware.input.InputManager;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -40,19 +42,46 @@ public final class MainActivity extends Activity implements InputManager.InputDe
     // is still being brought up. A copy of the library placed in the app's own
     // files directory takes precedence, so iterating on native code needs only
     // a file push. A normal build has no such file and loads the packaged one.
+    //
+    // 一个库覆盖机制必须有退出条件：装上新版 APK 之后，files/native 里那份仍然是
+    // 上一版（补丁时代推上去的）native 代码，跑起来就是"新版本号 + 旧引擎"。音频这种
+    // 只在某一版里才补完整的子系统最容易这样丢——引擎照常往 AAudio 写满帧，日志看着
+    // 一切正常，用户那头却是整局没声音。戳文件记下推库时的 versionCode，对不上就
+    // 不认这份库（并尽量删掉），让打包库接管。
+    private static final String HOT_STAMP="native/libot2host.version";
+    private static long installedVersionCode(Context context){
+        try{return context.getPackageManager().getPackageInfo(context.getPackageName(),0).getLongVersionCode();}
+        catch(Throwable unavailable){return -1;}
+    }
+    private static boolean hotLibraryMatches(Context context,long version){
+        try{
+            File stamp=new File(context.getFilesDir(),HOT_STAMP);
+            if(!stamp.isFile()||version<0)return false;
+            String text=new String(java.nio.file.Files.readAllBytes(stamp.toPath()),StandardCharsets.UTF_8).trim();
+            return text.equals(Long.toString(version));
+        }catch(Throwable unreadable){return false;}
+    }
     private static void loadNativeHost() {
         try {
             Class<?> activityThread = Class.forName("android.app.ActivityThread");
             Object application = activityThread.getMethod("currentApplication").invoke(null);
             if (application instanceof Context) {
-                File hot = new File(((Context) application).getFilesDir(), "native/libot2host.so");
+                Context context=(Context)application;
+                File hot = new File(context.getFilesDir(), "native/libot2host.so");
                 if (hot.isFile() && hot.length() > 0) {
-                    // Android 14+ only allows dynamically loaded code from a
-                    // file the app cannot modify afterwards.
-                    if (!hot.setReadOnly()) hot.setWritable(false, false);
-                    System.load(hot.getAbsolutePath());
-                    android.util.Log.i("OT2Native", "loaded " + hot.getAbsolutePath() + " (" + hot.length() + " bytes)");
-                    return;
+                    if (hotLibraryMatches(context,installedVersionCode(context))) {
+                        // Android 14+ only allows dynamically loaded code from a
+                        // file the app cannot modify afterwards.
+                        if (!hot.setReadOnly()) hot.setWritable(false, false);
+                        System.load(hot.getAbsolutePath());
+                        android.util.Log.i("OT2Native", "loaded " + hot.getAbsolutePath() + " (" + hot.length() + " bytes)");
+                        return;
+                    }
+                    // A stale copy wins the next start too unless it is gone. Deleting
+                    // can fail on a file made read-only by an older build; the stamp
+                    // check still keeps it out of the way.
+                    android.util.Log.w("OT2Native","stale hot library ignored (built for another version) removed="
+                        +hot.delete()+": "+hot.getAbsolutePath());
                 }
             }
         } catch (Throwable error) {
@@ -510,6 +539,7 @@ public final class MainActivity extends Activity implements InputManager.InputDe
                 }
                 if(startGame){
                     publish("正在启动游戏…");
+                    recordAudioEnvironment(context);
                     bootNative(directory.getAbsolutePath(),new File(profile.privateRoot,"boot.log").getAbsolutePath(),Long.parseUnsignedLong(profile.titleId,16));
                     synchronized(Session.class){phase=Phase.ENDED;}
                     publish("游戏运行已结束。");
@@ -520,6 +550,33 @@ public final class MainActivity extends Activity implements InputManager.InputDe
                 synchronized(Session.class){phase=Phase.FAILED;}
                 publish("验证失败："+error.getMessage());
             }
+        }
+    }
+    // 手机"没有声音"有一半是设备侧状态：媒体音量为 0、静音/勿扰、声音被路由到蓝牙或
+    // 耳机。这些从引擎日志里看不出来（引擎照常往 AAudio 写满 48 kHz 帧），只能问系统。
+    // 每次启动前抓一份写进 files/audio-env.txt 和 logcat，下次连 adb 就能一眼分出
+    // "引擎没输出" 和 "手机自己在静音"，不必再靠猜。
+    private static void recordAudioEnvironment(Context context){
+        try{
+            AudioManager audio=(AudioManager)context.getSystemService(Context.AUDIO_SERVICE);
+            if(audio==null)return;
+            StringBuilder outputs=new StringBuilder();
+            for(AudioDeviceInfo device:audio.getDevices(AudioManager.GET_DEVICES_OUTPUTS)){
+                if(device==null)continue;
+                outputs.append(device.getType()).append('|').append(device.getProductName()).append(';');
+            }
+            String line="media_volume="+audio.getStreamVolume(AudioManager.STREAM_MUSIC)
+                +"/"+audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                +" muted="+audio.isStreamMute(AudioManager.STREAM_MUSIC)
+                +" ringer="+audio.getRingerMode()
+                +" mode="+audio.getMode()
+                +" outputs="+(outputs.length()==0?"none":outputs.toString());
+            android.util.Log.i("OT2Audio",line);
+            try(FileOutputStream out=new FileOutputStream(new File(context.getFilesDir(),"audio-env.txt"))){
+                out.write(line.getBytes(StandardCharsets.UTF_8));
+            }
+        }catch(Throwable ignored){
+            // A missing audio service must not stop the boot.
         }
     }
     private void probe(){Session.request(this,bootRequested());}

@@ -25,6 +25,10 @@ struct Output {
     // producer that paces itself on a 5 ms timer can absorb its own jitter
     // instead of underrunning the stream.
     int buffer_frames{};
+    // Device route changes reopen the stream; the tier that worked is worth one
+    // line per open, because a phone that only accepts a fallback tier is exactly
+    // the "no sound on this model" report this log has to answer.
+    std::atomic<bool> logged_open{false};
     std::deque<Buffer*> pending,released;size_t position{};
     // All stream API calls are serialized here. The error callback only posts
     // recovery; closing a stream from its own callback can deadlock AAudio.
@@ -80,22 +84,62 @@ void request_recovery(Output& a,aaudio_result_t error){
     if(!a.recovery_requested.exchange(true))a.recovery_signal.release();
 }
 void stream_error(AAudioStream*,void* user,aaudio_result_t error){request_recovery(*static_cast<Output*>(user),error);}
+// 一档打不开就换更宽松的一档。
+//
+// LOW_LATENCY + 100 ms capacity 在平板上一次就过，手机上是另一回事：独占音频设备、
+// 只肯给小 buffer 的 HAL、或者干脆不支持低延迟模式的机型都会让 open 直接失败。原实现
+// 失败后按**同一套参数**每 250 ms 重试，于是"打不开"就永远打不开，从用户那头看就是
+// 整局游戏没有声音（进程还活着，画面也正常，最容易误判成引擎没输出）。降级链保证这种
+// 机型至少能从第二个能用的配置出声，日志里也留下"被哪一档救回来"的一行证据。
+struct StreamTier{aaudio_performance_mode_t mode;bool capacity;const char* name;};
+constexpr StreamTier kStreamTiers[]={
+    {AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,true ,"lowlat+cap"},
+    {AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,false,"lowlat"},
+    {AAUDIO_PERFORMANCE_MODE_NONE        ,false,"none"},
+};
 aaudio_result_t open_stream(Output& a){
-    AAudioStreamBuilder* b{};auto rc=AAudio_createStreamBuilder(&b);if(rc<0)return rc;
-    AAudioStreamBuilder_setDirection(b,AAUDIO_DIRECTION_OUTPUT);AAudioStreamBuilder_setFormat(b,AAUDIO_FORMAT_PCM_I16);
-    AAudioStreamBuilder_setChannelCount(b,a.channels);AAudioStreamBuilder_setSampleRate(b,a.rate);
-    AAudioStreamBuilder_setSharingMode(b,AAUDIO_SHARING_MODE_SHARED);AAudioStreamBuilder_setPerformanceMode(b,AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-    if(a.buffer_frames>0)AAudioStreamBuilder_setBufferCapacityInFrames(b,a.buffer_frames);
-    AAudioStreamBuilder_setDataCallback(b,render,&a);AAudioStreamBuilder_setErrorCallback(b,stream_error,&a);
-    rc=AAudioStreamBuilder_openStream(b,&a.stream);AAudioStreamBuilder_delete(b);
-    if(rc>=0){
+    aaudio_result_t last=AAUDIO_ERROR_INTERNAL;
+    for(const StreamTier& tier:kStreamTiers){
+        AAudioStreamBuilder* b{};auto rc=AAudio_createStreamBuilder(&b);if(rc<0)return rc;
+        AAudioStreamBuilder_setDirection(b,AAUDIO_DIRECTION_OUTPUT);AAudioStreamBuilder_setFormat(b,AAUDIO_FORMAT_PCM_I16);
+        AAudioStreamBuilder_setChannelCount(b,a.channels);AAudioStreamBuilder_setSampleRate(b,a.rate);
+        AAudioStreamBuilder_setSharingMode(b,AAUDIO_SHARING_MODE_SHARED);AAudioStreamBuilder_setPerformanceMode(b,tier.mode);
+        if(tier.capacity&&a.buffer_frames>0)AAudioStreamBuilder_setBufferCapacityInFrames(b,a.buffer_frames);
+        AAudioStreamBuilder_setDataCallback(b,render,&a);AAudioStreamBuilder_setErrorCallback(b,stream_error,&a);
+        rc=AAudioStreamBuilder_openStream(b,&a.stream);AAudioStreamBuilder_delete(b);
+        if(rc<0){
+            last=rc;
+            // 限流：一次失败的现场要留，但恢复线程 250 ms 一轮，不能把日志刷满。
+            static std::atomic<unsigned> reported{0};
+            if(reported.fetch_add(1,std::memory_order_relaxed)<8)
+                ot2_host_log("AUDIO_STREAM_OPEN_FAILED tier=%s rate=%d channels=%d error=%d (%s)",
+                             tier.name,a.rate,a.channels,rc,AAudio_convertResultToText(rc));
+            continue;
+        }
         // Guest buffers keep the original format across route changes. AAudio
-        // converts the requested format to the physical device's new format.
-        if(AAudioStream_getSampleRate(a.stream)!=a.rate || AAudioStream_getChannelCount(a.stream)!=a.channels)ot2_host_die("AAudio changed the requested PCM format");
+        // converts the requested format to the physical device's new format, so a
+        // stream that reports another format refused the request. Close it and try
+        // the next tier: dying here turned a silent phone into a crash report with
+        // nothing in it about audio.
+        const int rate=AAudioStream_getSampleRate(a.stream),channels=AAudioStream_getChannelCount(a.stream);
+        if(rate!=a.rate||channels!=a.channels){
+            last=AAUDIO_ERROR_INVALID_FORMAT;
+            static std::atomic<unsigned> reported{0};
+            if(reported.fetch_add(1,std::memory_order_relaxed)<8)
+                ot2_host_log("AUDIO_STREAM_FORMAT_REJECTED tier=%s wanted=%d/%d got=%d/%d",
+                             tier.name,a.rate,a.channels,rate,channels);
+            AAudioStream_close(a.stream);a.stream=nullptr;
+            continue;
+        }
+        static std::atomic<unsigned> reopened{0};
+        if(!a.logged_open.exchange(true) || reopened.fetch_add(1,std::memory_order_relaxed)<8)
+            ot2_host_log("AUDIO_STREAM_OPENED tier=%s rate=%d channels=%d capacity=%d",tier.name,rate,channels,
+                         tier.capacity?a.buffer_frames:0);
         a.generation.fetch_add(1);
         a.available=true;a.silent_changed.notify_all();
+        return AAUDIO_OK;
     }
-    return rc;
+    return last;
 }
 void close_stream(Output& a){a.available=false;a.silent_changed.notify_all();if(a.stream){AAudioStream_requestStop(a.stream);AAudioStream_close(a.stream);a.stream=nullptr;}}
 void recover_output(Output& a){

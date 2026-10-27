@@ -50,6 +50,13 @@ echo "== pushing"
 "$ADB" -s "$SERIAL" shell "run-as $PKG chmod 600 files/native/libot2host.so" 2>/dev/null || true
 cat "$SO" | "$ADB" -s "$SERIAL" shell "run-as $PKG sh -c 'cat > files/native/libot2host.so'"
 echo "   on device: $("$ADB" -s "$SERIAL" shell "run-as $PKG stat -c %s files/native/libot2host.so" | tr -d '\r') bytes"
+# 热推库的版本戳：MainActivity 只在 versionCode 与本机安装包一致时才接受这份库，
+# 否则会忽略并尽量删除它（换 APK 后自动回退到打包库，避免"新包跑旧 native"）。
+VERSION=$("$ADB" -s "$SERIAL" shell "dumpsys package $PKG" 2>/dev/null | grep -m1 versionCode | tr -dc '0-9')
+if [ -n "$VERSION" ]; then
+    "$ADB" -s "$SERIAL" shell "run-as $PKG sh -c 'echo $VERSION > files/native/libot2host.version'"
+    echo "   stamp: versionCode=$VERSION"
+fi
 
 echo "== starting"
 "$ADB" -s "$SERIAL" shell am start -n "$PKG/dev.ot2.port.LauncherActivity" >/dev/null

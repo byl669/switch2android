@@ -14,11 +14,13 @@
 #include <vector>
 
 struct AAudioStreamBuilder {
-    int channels=2,rate=48000;AAudioStream_dataCallback render{};AAudioStream_errorCallback error{};void* data{};void* error_data{};
+    int channels=2,rate=48000,perf=0,capacity=0;AAudioStream_dataCallback render{};AAudioStream_errorCallback error{};void* data{};void* error_data{};
 };
 struct AAudioStream:AAudioStreamBuilder {bool closed=false,disconnected=false,started=false;};
 std::mutex api_mutex;std::vector<std::unique_ptr<AAudioStream>> streams;
 std::atomic<unsigned> opens{},closes{},bad_calls{},failed_opens{};bool fail_next_open=false;std::atomic<bool> fail_all_opens=false;
+// 模拟"这台机型的 HAL 不支持低延迟模式"：降级链必须靠它才测得到。
+bool reject_lowlat=false;
 thread_local bool in_error_callback=false;
 aaudio_result_t AAudio_createStreamBuilder(AAudioStreamBuilder** b){*b=new AAudioStreamBuilder;return 0;}
 void AAudioStreamBuilder_setDirection(AAudioStreamBuilder*,int){}
@@ -26,11 +28,13 @@ void AAudioStreamBuilder_setFormat(AAudioStreamBuilder*,int){}
 void AAudioStreamBuilder_setChannelCount(AAudioStreamBuilder* b,int n){b->channels=n;}
 void AAudioStreamBuilder_setSampleRate(AAudioStreamBuilder* b,int n){b->rate=n;}
 void AAudioStreamBuilder_setSharingMode(AAudioStreamBuilder*,int){}
-void AAudioStreamBuilder_setPerformanceMode(AAudioStreamBuilder*,int){}
+void AAudioStreamBuilder_setPerformanceMode(AAudioStreamBuilder* b,int n){b->perf=n;}
+void AAudioStreamBuilder_setBufferCapacityInFrames(AAudioStreamBuilder* b,int32_t n){b->capacity=n;}
 void AAudioStreamBuilder_setDataCallback(AAudioStreamBuilder* b,AAudioStream_dataCallback f,void* p){b->render=f;b->data=p;}
 void AAudioStreamBuilder_setErrorCallback(AAudioStreamBuilder* b,AAudioStream_errorCallback f,void* p){b->error=f;b->error_data=p;}
 aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder* b,AAudioStream** s){
     std::lock_guard lock(api_mutex);if(in_error_callback)++bad_calls;
+    if(reject_lowlat&&b->perf==AAUDIO_PERFORMANCE_MODE_LOW_LATENCY){++failed_opens;return AAUDIO_ERROR_NO_SERVICE;}
     if(fail_next_open||fail_all_opens){fail_next_open=false;++failed_opens;return AAUDIO_ERROR_NO_SERVICE;}
     auto stream=std::make_unique<AAudioStream>();static_cast<AAudioStreamBuilder&>(*stream)=*b;*s=stream.get();streams.push_back(std::move(stream));++opens;return 0;
 }
@@ -70,6 +74,17 @@ int main(){try{
     const char* contains="_ZN2nn5audio22ContainsAudioOutBufferEPKNS0_8AudioOutEPKNS0_14AudioOutBufferE";
     std::array<char,272> devices;devices.fill(char(0x5a));
     require(call("_ZN2nn5audio13ListAudioOutsEPNS0_12AudioOutInfoEi",{address(devices.data()),1})==1&&!strcmp(devices.data(),"DeviceOut")&&devices[256]==0x5a,"Device enumeration ABI guard");
+    // 降级链：不支持低延迟模式的机型（两档 low-latency 都被拒）必须落到 NONE 档打开，
+    // 而不是拿同一套参数一直重试——那就是"画面正常、整局没有声音"的现场。
+    {
+        reject_lowlat=true;
+        const unsigned before=failed_opens;
+        call(open,{address(&object),address(&params)});
+        require(failed_opens>=before+2,"Tries the low-latency tiers before falling back");
+        {std::lock_guard lock(api_mutex);require(streams.back()->perf==AAUDIO_PERFORMANCE_MODE_NONE,"Falls back to the default performance mode instead of failing the open");}
+        reject_lowlat=false;
+        call(close,{address(&object)});
+    }
     call(open,{address(&object),address(&params)});require(call(state,{address(&object)})==1,"SDK stopped state is one");call(start,{address(&object)});require(call(state,{address(&object)})==0,"SDK started state is zero");
     std::array<int16_t,16> pcm;for(int i=0;i<16;i++)pcm[i]=100+i;
     std::array<uint64_t,4> buffer{};
@@ -77,9 +92,15 @@ int main(){try{
     require(call("_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE",{address(&object),address(buffer.data())})==1,"SDK AppendAudioOutBuffer returns bool true on success");
     require(call(count,{address(&object)})==1&&call(contains,{address(&object),address(buffer.data())})==1,"Pending buffer queries");
     require(consume(3)==std::vector<int16_t>(pcm.begin(),pcm.begin()+6),"Initial PCM");
-    disconnect(true);wait_open(2);
+    const unsigned resumed=opens+1;
+    disconnect(true);wait_open(resumed);
     for(int i=0;i<100&&!playing();i++)std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    require(consume(5)==std::vector<int16_t>(10,0),"Unavailable output silently consumes in real time instead of replaying stale PCM");
+    // 降级链让重开几乎立刻发生（旧实现要等满 250 ms 的重试周期），于是这里有两种合法结果：
+    // pending 已被实时消费掉（全 0），或者把剩下的 10 个样本接着播完。关键是只消费一次、
+    // 不重复渲染同一段 PCM。
+    const auto tail=consume(5);
+    require(tail==std::vector<int16_t>(10,0)||tail==std::vector<int16_t>(pcm.begin()+6,pcm.end()),
+            "Resumed output consumes the leftover PCM exactly once");
     require(call(count,{address(&object)})==0&&call(contains,{address(&object),address(buffer.data())})==1,"Released buffer remains owned until retrieved");
     require(call("_ZN2nn5audio28GetAudioOutPlayedSampleCountEPKNS0_8AudioOutE",{address(&object)})==8,"Recovery preserves playback count through the actual SDK export");
     require(call("_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE",{address(&object)})==address(buffer.data()),"Recovery releases original buffer once");
@@ -93,7 +114,8 @@ int main(){try{
     for(int i=0;i<100&&call(count,{address(&object)});i++)std::this_thread::sleep_for(std::chrono::milliseconds(5));
     require(call(count,{address(&object)})==0,"Background silent sink must release PCM and keep SDK audio pacing alive");
     require(call("_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE",{address(&object)})==address(buffer.data()),"Background returns the same buffer");
-    disconnect();wait_open(3);require(!playing(),"Background recovery must stay paused");
+    const unsigned background=opens+1;
+    disconnect();wait_open(background);require(!playing(),"Background recovery must stay paused");
     call(stop,{address(&object)});ot2::set_audio_active(true);require(!playing(),"Focus cannot restart explicitly stopped output");
     call(start,{address(&object)});require(playing(),"Explicit restart after recovery");
     call(close,{address(&object)});
@@ -111,9 +133,10 @@ int main(){try{
     for(size_t i=0;i<64;i++)require(call("_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE",{address(&object)})==address(queued[i].data()),"Flush preserves release order");
     require(call("_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE",{address(&object),address(queued[64].data())})==1,"Retrieved buffers free capacity");
     call(close,{address(&object)});
+    const unsigned failures=failed_opens;
     call(open,{address(&object),address(&params)});disconnect(true);
-    for(int i=0;i<100&&failed_opens<2;i++)std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    require(failed_opens>=2,"Exercise close while waiting to retry");call(close,{address(&object)});
+    for(int i=0;i<100&&failed_opens==failures;i++)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    require(failed_opens>failures,"Exercise close while waiting to retry");call(close,{address(&object)});
     for(int i=0;i<30;i++){call(open,{address(&object),address(&params)});call(start,{address(&object)});disconnect();call(close,{address(&object)});}
     fail_all_opens=true;call(open,{address(&object),address(&params)});call(start,{address(&object)});
     call("_ZN2nn5audio20AppendAudioOutBufferEPNS0_8AudioOutEPNS0_14AudioOutBufferE",{address(&object),address(buffer.data())});

@@ -52,7 +52,12 @@ cat "$SO" | "$ADB" -s "$SERIAL" shell "run-as $PKG sh -c 'cat > files/native/lib
 echo "   on device: $("$ADB" -s "$SERIAL" shell "run-as $PKG stat -c %s files/native/libot2host.so" | tr -d '\r') bytes"
 # 热推库的版本戳：MainActivity 只在 versionCode 与本机安装包一致时才接受这份库，
 # 否则会忽略并尽量删除它（换 APK 后自动回退到打包库，避免"新包跑旧 native"）。
-VERSION=$("$ADB" -s "$SERIAL" shell "dumpsys package $PKG" 2>/dev/null | grep -m1 versionCode | tr -dc '0-9')
+# 只取 versionCode= 后面的数字：整行还有 minSdk=/targetSdk=，用 tr -dc 0-9 会把它们
+# 一起粘进来（224 变成 2243336），戳对不上，MainActivity 就把刚推的库当陈旧版删掉。
+# Take only the digits of versionCode=: the same line carries minSdk=/targetSdk=, and
+# stripping everything but digits glued them on (224 -> 2243336), so MainActivity saw a
+# stamp mismatch and deleted the library that had just been pushed.
+VERSION=$("$ADB" -s "$SERIAL" shell "dumpsys package $PKG" 2>/dev/null | grep -m1 -o 'versionCode=[0-9]*' | cut -d= -f2)
 if [ -n "$VERSION" ]; then
     "$ADB" -s "$SERIAL" shell "run-as $PKG sh -c 'echo $VERSION > files/native/libot2host.version'"
     echo "   stamp: versionCode=$VERSION"

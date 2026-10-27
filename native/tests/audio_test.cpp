@@ -21,6 +21,8 @@ std::mutex api_mutex;std::vector<std::unique_ptr<AAudioStream>> streams;
 std::atomic<unsigned> opens{},closes{},bad_calls{},failed_opens{};bool fail_next_open=false;std::atomic<bool> fail_all_opens=false;
 // 模拟"这台机型的 HAL 不支持低延迟模式"：降级链必须靠它才测得到。
 bool reject_lowlat=false;
+// 反过来也要能模拟"连普通混音都打不开"的机型，否则测不到 mixer 优先时的降级。
+bool reject_mixer=false;
 thread_local bool in_error_callback=false;
 aaudio_result_t AAudio_createStreamBuilder(AAudioStreamBuilder** b){*b=new AAudioStreamBuilder;return 0;}
 void AAudioStreamBuilder_setDirection(AAudioStreamBuilder*,int){}
@@ -35,12 +37,14 @@ void AAudioStreamBuilder_setErrorCallback(AAudioStreamBuilder* b,AAudioStream_er
 aaudio_result_t AAudioStreamBuilder_openStream(AAudioStreamBuilder* b,AAudioStream** s){
     std::lock_guard lock(api_mutex);if(in_error_callback)++bad_calls;
     if(reject_lowlat&&b->perf==AAUDIO_PERFORMANCE_MODE_LOW_LATENCY){++failed_opens;return AAUDIO_ERROR_NO_SERVICE;}
+    if(reject_mixer&&b->perf==AAUDIO_PERFORMANCE_MODE_NONE){++failed_opens;return AAUDIO_ERROR_NO_SERVICE;}
     if(fail_next_open||fail_all_opens){fail_next_open=false;++failed_opens;return AAUDIO_ERROR_NO_SERVICE;}
     auto stream=std::make_unique<AAudioStream>();static_cast<AAudioStreamBuilder&>(*stream)=*b;*s=stream.get();streams.push_back(std::move(stream));++opens;return 0;
 }
 aaudio_result_t AAudioStreamBuilder_delete(AAudioStreamBuilder* b){delete b;return 0;}
 int32_t AAudioStream_getSampleRate(AAudioStream* s){return s->rate;}
 int32_t AAudioStream_getChannelCount(AAudioStream* s){return s->channels;}
+int32_t AAudioStream_getState(AAudioStream* s){return s->started?AAUDIO_STREAM_STATE_STARTED:AAUDIO_STREAM_STATE_PAUSED;}
 aaudio_result_t request(AAudioStream* s,bool start){std::lock_guard lock(api_mutex);if(s->closed||in_error_callback)++bad_calls;if(s->disconnected)return AAUDIO_ERROR_DISCONNECTED;s->started=start;return 0;}
 aaudio_result_t AAudioStream_requestStart(AAudioStream* s){return request(s,true);}
 aaudio_result_t AAudioStream_requestStop(AAudioStream* s){return request(s,false);}
@@ -49,6 +53,9 @@ aaudio_result_t AAudioStream_close(AAudioStream* s){std::lock_guard lock(api_mut
 const char* AAudio_convertResultToText(aaudio_result_t){return "test audio error";}
 extern "C" [[noreturn]] void ot2_host_die(const char* format,...){char text[256];va_list ap;va_start(ap,format);vsnprintf(text,sizeof(text),format,ap);va_end(ap);throw std::runtime_error(text);}
 extern "C" void ot2_host_log(const char*,...){}
+// 标记文件在设备上是 files/games/<id>/<name>；测试里用一个可切换的名字模拟它存在。
+const char* forced_flag=nullptr;
+extern "C" int ot2_game_flag(const char* name){return forced_flag&&!strcmp(forced_flag,name);}
 extern "C" int ot2_signal_event(uint32_t){return 0;}
 extern "C" uint64_t ot2_call_guest(const char*,const uint64_t*){throw std::runtime_error("Unexpected guest call in AudioOut test");}
 uint64_t call(const char* name,std::initializer_list<uint64_t> args){uint64_t r[8]{};std::copy(args.begin(),args.end(),r);for(auto& s:ot2::audio_services())if(!strcmp(s.name,name))return s.call(r);throw std::runtime_error("Missing audio service");}
@@ -74,15 +81,27 @@ int main(){try{
     const char* contains="_ZN2nn5audio22ContainsAudioOutBufferEPKNS0_8AudioOutEPKNS0_14AudioOutBufferE";
     std::array<char,272> devices;devices.fill(char(0x5a));
     require(call("_ZN2nn5audio13ListAudioOutsEPNS0_12AudioOutInfoEi",{address(devices.data()),1})==1&&!strcmp(devices.data(),"DeviceOut")&&devices[256]==0x5a,"Device enumeration ABI guard");
-    // 降级链：不支持低延迟模式的机型（两档 low-latency 都被拒）必须落到 NONE 档打开，
-    // 而不是拿同一套参数一直重试——那就是"画面正常、整局没有声音"的现场。
+    // 两条都不能丢：
+    // ① 默认必须走混音器（NONE）。低延迟档会让系统建出 DIRECT|MMAP_NOIRQ 直通流，
+    //    在蓝牙耳机上出现过"流是 STARTED、我们的 PCM 有峰值、系统一声不响，
+    //    切后台再回前台、流被重开之后才出声"的现场。
+    // ② 反过来，机型连混音器都不给时仍要落到低延迟档，不能整局无声。
     {
-        reject_lowlat=true;
+        call(open,{address(&object),address(&params)});
+        {std::lock_guard lock(api_mutex);require(streams.back()->perf==AAUDIO_PERFORMANCE_MODE_NONE,"Defaults to the mixer path instead of a low-latency direct stream");}
+        call(close,{address(&object)});
+        reject_mixer=true;
         const unsigned before=failed_opens;
         call(open,{address(&object),address(&params)});
-        require(failed_opens>=before+2,"Tries the low-latency tiers before falling back");
-        {std::lock_guard lock(api_mutex);require(streams.back()->perf==AAUDIO_PERFORMANCE_MODE_NONE,"Falls back to the default performance mode instead of failing the open");}
-        reject_lowlat=false;
+        require(failed_opens>before,"Falls back when the mixer path is refused");
+        {std::lock_guard lock(api_mutex);require(streams.back()->perf==AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,"Falls back to a low-latency tier when the mixer is unavailable");}
+        reject_mixer=false;
+        call(close,{address(&object)});
+        // 标记存在时回到低延迟优先，留给想试直通的机型；默认行为不受影响。
+        forced_flag="audio-lowlatency";
+        call(open,{address(&object),address(&params)});
+        {std::lock_guard lock(api_mutex);require(streams.back()->perf==AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,"audio-lowlatency marker restores the direct stream");}
+        forced_flag=nullptr;
         call(close,{address(&object)});
     }
     call(open,{address(&object),address(&params)});require(call(state,{address(&object)})==1,"SDK stopped state is one");call(start,{address(&object)});require(call(state,{address(&object)})==0,"SDK started state is zero");

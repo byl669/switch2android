@@ -34,11 +34,17 @@ struct Output {
     // recovery; closing a stream from its own callback can deadlock AAudio.
     std::mutex control;std::counting_semaphore<> recovery_signal{0};std::thread recovery_thread,silent_thread;
     std::condition_variable silent_changed;std::atomic<bool> active{true},available{false};
+    // 输出侧诊断：区分"流没跑起来"和"流在跑但游戏混音是静音"。
+    // 首次打开无声的现场只有这三条线一起看才定得下来，缺一条就会误判方向。
+    std::atomic<uint64_t> hardware_frames{0};std::atomic<unsigned> gate_stopped{0},gate_background{0},gate_unavailable{0};
+    // 停滞自愈用：流打开的时刻与已重开次数。硬件回调迟迟不来时只有重开流能解开。
+    std::atomic<int64_t> opened_at_ms{0};std::atomic<unsigned> stall_reopens{0};
     std::atomic<bool> recovery_requested{false},closing{false};std::atomic<unsigned> generation{0};
     std::atomic<aaudio_result_t> last_error{0};
     ~Output();
 };
 std::mutex outputs_mutex;std::map<uint64_t,std::shared_ptr<Output>> outputs;std::atomic<bool> audio_active{true};
+int64_t now_ms(){return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 std::shared_ptr<Output> output(uint64_t id){std::lock_guard lock(outputs_mutex);auto it=outputs.find(id);if(it==outputs.end())ot2_host_die("Unknown AudioOut object");return it->second;}
 void check_audio(aaudio_result_t result,const char* call){if(result<0)ot2_host_die("AAudio %s: %s",call,AAudio_convertResultToText(result));}
 void consume(Output& a,void* data,int32_t frames){
@@ -47,7 +53,16 @@ void consume(Output& a,void* data,int32_t frames){
         std::lock_guard lock(a.mutex);
         // A late real callback after pause supplies silence. Only the active
         // consumer can advance the queue, so focus changes never replay data.
-        if(!a.started || bool(data)!=(a.active.load()&&a.available.load())){if(dst)memset(dst,0,bytes);return;}
+        if(!a.started || bool(data)!=(a.active.load()&&a.available.load())){
+            // 被拦下的原因必须要能分开：stopped = 游戏自己没开始播；
+            // background = 我们按焦点闸掉的；unavailable = 流没打开。
+            auto& counter=a.started?(a.active.load()?a.gate_unavailable:a.gate_background):a.gate_stopped;
+            const unsigned n=counter.fetch_add(1,std::memory_order_relaxed)+1;
+            if(n==1 || n%2000==0)
+                ot2_host_log("AUDIO_SINK_GATED reason=%s count=%u active=%d available=%d started=%d",
+                             a.started?(a.active.load()?"unavailable":"background"):"stopped",n,
+                             int(a.active.load()),int(a.available.load()),int(a.started.load()));
+            if(dst)memset(dst,0,bytes);return;} 
         while(bytes){
             if(a.pending.empty()){if(dst)memset(dst,0,bytes);break;}
             auto* b=a.pending.front();size_t n=std::min(bytes,size_t(b->size-a.position));
@@ -59,8 +74,17 @@ void consume(Output& a,void* data,int32_t frames){
     a.played_frames.fetch_add(consumed/(a.channels*2),std::memory_order_relaxed);
     if(released && a.event)ot2_signal_event(a.event);
 }
-aaudio_data_callback_result_t render(AAudioStream*,void* user,void* data,int32_t frames) {
-    auto& a=*static_cast<Output*>(user);consume(a,data,frames);
+aaudio_data_callback_result_t render(AAudioStream* stream,void* user,void* data,int32_t frames) {
+    auto& a=*static_cast<Output*>(user);
+    // 只有硬件真的在拉数据时这个计数才涨。它和 AUDREN 侧写进去的帧数是两条
+    // 独立的线：前者为 0 说明流没跑起来（输出侧问题），前者正常而游戏混音静音
+    // 才是内容问题。首次打开无声的分歧点全在这个区分上。
+    const uint64_t pulled=a.hardware_frames.fetch_add(uint64_t(frames),std::memory_order_relaxed)+uint64_t(frames);
+    const uint64_t bucket=pulled/(uint64_t(a.rate)*10);
+    if(pulled==uint64_t(frames)||bucket!=(pulled-uint64_t(frames))/(uint64_t(a.rate)*10))
+        ot2_host_log("AUDIO_HARDWARE_PULL frames=%llu state=%d active=%d available=%d",
+                     (unsigned long long)pulled,int(AAudioStream_getState(stream)),int(a.active.load()),int(a.available.load()));
+    consume(a,data,frames);
     if(!a.logged_pcm){auto* pcm=static_cast<const int16_t*>(data);int peak=0;for(int i=0;i<frames*a.channels;i++)peak=std::max(peak,std::abs(int(pcm[i])));if(peak){a.logged_pcm=true;ot2_host_log("AUDIO_PCM_NONZERO peak=%d channels=%d rate=%d",peak,a.channels,a.rate);}}
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
@@ -91,15 +115,37 @@ void stream_error(AAudioStream*,void* user,aaudio_result_t error){request_recove
 // 失败后按**同一套参数**每 250 ms 重试，于是"打不开"就永远打不开，从用户那头看就是
 // 整局游戏没有声音（进程还活着，画面也正常，最容易误判成引擎没输出）。降级链保证这种
 // 机型至少能从第二个能用的配置出声，日志里也留下"被哪一档救回来"的一行证据。
+//
+// 默认顺序是 **mixer 优先**，不是低延迟优先。原因是一份 A/B 现场：同一台手机、
+// 同一个蓝牙耳机，LOW_LATENCY 会让系统建出 DIRECT|MMAP_NOIRQ 直通流
+// （audio_flinger 里是 `AudioMmapOut_*` + flags 0x4001）。这条路径在我们自己这边
+// 一切正常——`AUDREN sink wrote peak=1767`、pending 里有数据——但硬件回调一帧都
+// 不来，`AUDIO_PCM_NONZERO` 从头到尾不出现，于是整局静音；一旦切后台再回前台
+// （或蓝牙路由变化）触发流重开，立刻就有声音。换成 NONE 走 AudioFlinger 混音器
+// 之后，首次启动就正常出声。原生游戏用 AudioTrack 走的正是混音器，所以"别的游戏
+// 有声、只有这个没声"不是设备问题。
+//
+// 直通不是不能用，只是不该默认用：它对路由变化太脆，而这个标题并不需要低延迟。
+// 想试直通的机型放 `audio-lowlatency` 标记即可回到旧顺序。
 struct StreamTier{aaudio_performance_mode_t mode;bool capacity;const char* name;};
-constexpr StreamTier kStreamTiers[]={
-    {AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,true ,"lowlat+cap"},
-    {AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,false,"lowlat"},
-    {AAUDIO_PERFORMANCE_MODE_NONE        ,false,"none"},
+constexpr StreamTier kMixerFirst[]={
+    {AAUDIO_PERFORMANCE_MODE_NONE        ,false,"mixer"},
+    {AAUDIO_PERFORMANCE_MODE_LOW_LATENCY ,false,"lowlat"},
+    {AAUDIO_PERFORMANCE_MODE_LOW_LATENCY ,true ,"lowlat+cap"},
+};
+constexpr StreamTier kLowLatencyFirst[]={
+    {AAUDIO_PERFORMANCE_MODE_LOW_LATENCY ,true ,"lowlat+cap"},
+    {AAUDIO_PERFORMANCE_MODE_LOW_LATENCY ,false,"lowlat"},
+    {AAUDIO_PERFORMANCE_MODE_NONE        ,false,"mixer"},
 };
 aaudio_result_t open_stream(Output& a){
     aaudio_result_t last=AAUDIO_ERROR_INTERNAL;
-    for(const StreamTier& tier:kStreamTiers){
+    const bool want_low_latency=ot2_game_flag("audio-lowlatency")!=0;
+    const StreamTier* tiers=want_low_latency?kLowLatencyFirst:kMixerFirst;
+    if(want_low_latency)
+        ot2_host_log("AUDIO_STREAM_LOWLATENCY_FORCED reason=audio-lowlatency marker");
+    for(size_t ti=0;ti<3;ti++){
+        const StreamTier& tier=tiers[ti];
         AAudioStreamBuilder* b{};auto rc=AAudio_createStreamBuilder(&b);if(rc<0)return rc;
         AAudioStreamBuilder_setDirection(b,AAUDIO_DIRECTION_OUTPUT);AAudioStreamBuilder_setFormat(b,AAUDIO_FORMAT_PCM_I16);
         AAudioStreamBuilder_setChannelCount(b,a.channels);AAudioStreamBuilder_setSampleRate(b,a.rate);
@@ -136,6 +182,9 @@ aaudio_result_t open_stream(Output& a){
             ot2_host_log("AUDIO_STREAM_OPENED tier=%s rate=%d channels=%d capacity=%d",tier.name,rate,channels,
                          tier.capacity?a.buffer_frames:0);
         a.generation.fetch_add(1);
+        // 每个新流单独计数：硬件拉了多少帧只对"当前这条流"有意义，跨流累计会让
+        // 一个新建却没人拉取的流永远看不到停滞。
+        a.opened_at_ms=now_ms();a.hardware_frames=0;
         a.available=true;a.silent_changed.notify_all();
         return AAUDIO_OK;
     }
@@ -172,8 +221,15 @@ Output::~Output(){
 }
 void transition(Output& a,bool start,bool pause=false){
     std::lock_guard lock(a.control);
-    if(!a.stream || a.recovery_requested)return;
+    if(!a.stream || a.recovery_requested){
+        // 静默跳过就是"start 了但什么都没发生"的来源，必须留痕：以前这里返回
+        // 得悄无声息，日志上看不出游戏要播、我们却没把流拉起来。
+        ot2_host_log("AUDIO_TRANSITION_SKIPPED start=%d stream=%d recovery=%d",
+                     int(start),int(a.stream!=nullptr),int(a.recovery_requested.load()));
+        return;}
     auto result=start?AAudioStream_requestStart(a.stream):pause?AAudioStream_requestPause(a.stream):AAudioStream_requestStop(a.stream);
+    if(result<0 || start)
+        ot2_host_log("AUDIO_TRANSITION start=%d rc=%d state=%d",int(start),result,int(AAudioStream_getState(a.stream)));
     if(result<0)request_recovery(a,result);
 }
 uint64_t open_output(uint64_t object,uint64_t event,uint64_t params) {
@@ -195,6 +251,7 @@ uint64_t start_output(uint64_t object,bool start){
 }
 void set_audio_active(bool active){
     std::lock_guard lock(outputs_mutex);audio_active=active;
+    ot2_host_log("AUDIO_ACTIVE active=%d outputs=%zu",int(active),outputs.size());
     for(auto& [id,a]:outputs){
         {std::lock_guard control(a->control);a->active=active;}a->silent_changed.notify_all();
         if(a->started)transition(*a,active,!active);
@@ -255,8 +312,8 @@ uint64_t audren_sink_open(int rate,int channels){
     // case that path exists to prevent.
     {std::lock_guard lock(outputs_mutex);outputs.emplace(id,a);}
     {std::lock_guard lock(audren_mutex);audren_sinks.emplace(id,sink);}
-    ot2_host_log("AUDIO_SINK_OPEN id=%llu rate=%d channels=%d capacity=%d frames",
-                 (unsigned long long)id,rate,channels,a->buffer_frames);
+    ot2_host_log("AUDIO_SINK_OPEN id=%llu rate=%d channels=%d capacity=%d frames active=%d stream=%d",
+                 (unsigned long long)id,rate,channels,a->buffer_frames,int(a->active.load()),int(a->stream!=nullptr));
     return id;
 }
 void audren_sink_write(uint64_t sink,const int16_t* interleaved,int frames){
@@ -280,6 +337,33 @@ void audren_sink_write(uint64_t sink,const int16_t* interleaved,int frames){
     block->size=bytes;
     memcpy(block->data,interleaved,bytes);
     a.pending.push_back(block);
+    // 队列封顶：硬件不拉的时候这里会一直涨，攒下几十秒的音频再一次性放出来，
+    // 比丢帧难听得更明显，也会把蓝牙编码器的缓冲撑爆。丢最旧的。
+    while(a.pending.size()>200){
+        Buffer* oldest=a.pending.front();a.pending.pop_front();
+        if(oldest->capacity>=bytes)s->spare.push_back(oldest);
+        else{free(oldest->data);free(oldest);}
+        a.position=0; // position 只对队首有意义，丢块之后剩余量必须归零。
+    }
+    // 停滞自愈：数据在涨、硬件却一帧都没拉过。直通流在蓝牙 A2DP 上会卡在这个
+    // 状态——流是 STARTED、我们的 PCM 有峰值、系统里一声不响——只有重开流能解开。
+    // 从没拉过一帧才判定，所以正常流里的短促卡顿不会误触发。
+    if(a.pending.size()>=60 && a.hardware_frames.load(std::memory_order_relaxed)==0
+       && a.active.load() && a.available.load() && a.started.load()){
+        const int64_t elapsed=now_ms()-a.opened_at_ms.load();
+        const unsigned tries=a.stall_reopens.load();
+        if(elapsed>1500 && tries<3 && !a.recovery_requested.load()){
+            a.stall_reopens.fetch_add(1,std::memory_order_relaxed);
+            ot2_host_log("AUDIO_STALL_REOPEN elapsed_ms=%lld queued=%zu attempt=%u",
+                         (long long)elapsed,a.pending.size(),tries+1);
+            request_recovery(a,AAUDIO_ERROR_TIMEOUT);
+        } else if(tries==0){
+            static std::atomic<unsigned> reported{0};
+            if(reported.fetch_add(1,std::memory_order_relaxed)<6)
+                ot2_host_log("AUDIO_SINK_BACKLOG_NO_PULL queued=%zu available=%d state=%d",
+                             a.pending.size(),int(a.available.load()),a.stream?int(AAudioStream_getState(a.stream)):-1);
+        }
+    }
 }
 void audren_sink_close(uint64_t sink){
     std::shared_ptr<AudrenSink> s;

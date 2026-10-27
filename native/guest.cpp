@@ -2063,6 +2063,40 @@ extern "C" void ot2_signal_handler(int sig,siginfo_t* info,void* raw) {
             log("FAULT_STACK perms sp=%#x page=%#x addr=%#x",
                 memory_permission_at(sp),memory_permission_at(sp&~uintptr_t(4095)),
                 memory_permission_at(reinterpret_cast<uintptr_t>(info->si_addr)));
+            // 通用寄存器全量转储。事后只看 PC 反汇编往往判断不出这次访存的
+            // 基址寄存器是从哪里来的；x0..x30 才是能直接定位的那一层。
+            {
+                const unsigned long long *g=uc->uc_mcontext.regs;
+                for(int i=0;i<31;i+=6){
+                    char line[288];int at=0;
+                    for(int j=i;j<i+6&&j<31;++j)
+                        at+=snprintf(line+at,sizeof(line)-size_t(at),"x%d=%#llx ",j,(unsigned long long)g[j]);
+                    if(at>0&&at<int(sizeof(line)))log("FAULT_REG %s",line);
+                }
+                log("FAULT_REG sp=%#llx pc=%#llx lr=%#llx fp=%#llx",
+                    (unsigned long long)uc->uc_mcontext.sp,(unsigned long long)uc->uc_mcontext.pc,
+                    (unsigned long long)g[30],(unsigned long long)g[29]);
+            }
+            // 当前帧内的结构体整块转储。访存越界常常是"交给某个服务的结构体
+            // 没被填满、游戏读到未初始化字段当循环上界"，只看寄存器看不出哪个
+            // 字段是空的，把 sp 往后 0x300 字节原样打出来最快。
+            {
+                uint32_t frame_words[0x300/4]{};
+                const auto sp=uc->uc_mcontext.sp;
+                struct iovec local{frame_words,sizeof(frame_words)};
+                struct iovec remote{reinterpret_cast<void*>(sp),sizeof(frame_words)};
+                const auto got=process_vm_readv(getpid(),&local,1,&remote,1,0);
+                if(got>0){
+                    log("FAULT_FRAME sp=%#llx bytes=%lld",(unsigned long long)sp,(long long)got);
+                    for(size_t i=0;i<sizeof(frame_words)/4;i+=8){
+                        char line[256];int at=0;
+                        at+=snprintf(line+at,sizeof(line)-size_t(at),"+%03zx:",i*4);
+                        for(size_t j=i;j<i+8&&j<sizeof(frame_words)/4;++j)
+                            at+=snprintf(line+at,sizeof(line)-size_t(at)," %08x",frame_words[j]);
+                        if(at>0&&at<int(sizeof(line)))log("FAULT_FRAME %s",line);
+                    }
+                }
+            }
             // 故障地址落在哪一段 mapping、以及内存里真实的指令编码。
             // 只看模块文件会误导：加载期 TLS 重写会把 mrs/msr 换成 `b island`，
             // 文件里那条指令和真正执行的不是同一条。这里两样都打出来。

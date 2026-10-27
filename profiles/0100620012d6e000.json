@@ -2,9 +2,10 @@
   "title_id": "0100620012d6e000",
   "name": "Big Brain Academy: Brain vs. Brain",
   "status": "experimental",
-  "versions": [0],
+  "versions": [0, 65536],
   "main_build_ids": [
-    "b8ee97e69499bcda50d6e17815f493cb00000000000000000000000000000000"
+    "b8ee97e69499bcda50d6e17815f493cb00000000000000000000000000000000",
+    "bfed48f22df30be71b4eeae5b0373a9f00000000000000000000000000000000"
   ],
   "resource_adapter": "generic",
   "default_fps": 60

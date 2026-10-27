@@ -29,10 +29,10 @@ android {
         // 默认值与 tools/build-full-apk.sh 保持一致，这样不带
         // -Ps2aVersionCode/-Ps2aVersionName 裸编译也不会退回旧版本而产出
         // "看起来没更新"的包。安装器只比较 versionCode，所以它必须单调递增。
-        versionCode = providers.gradleProperty("s2aVersionCode").getOrElse("211").toInt()
+        versionCode = providers.gradleProperty("s2aVersionCode").getOrElse("220").toInt()
         // The host reached its first playable milestone at 1.0.0; the revision
         // number is what the installer compares, so it is supplied per build.
-        versionName = providers.gradleProperty("s2aVersionName").getOrElse("1.5.1")
+        versionName = providers.gradleProperty("s2aVersionName").getOrElse("2.0")
         // 桌面图标下的显示名（2026-10-27 定稿）：中文「灵活脑学校」，与图标「脑」配套。
         // 与 s2aName 分离：s2aName 仍是游戏原名，只作为内部标识/日志用，不再当 label。
         // 需要临时换名时传 -Ps2aLabel="xxx"，不带参数就是中文名。

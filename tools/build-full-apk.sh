@@ -20,8 +20,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORKSPACE=$(cd "$ROOT/.." && pwd)
 
 PRODUCT=${1:-$WORKSPACE/s2a-out-diag/0100620012d6e000-v0}
-VERSION_CODE=${2:-211}
-VERSION_NAME=${3:-1.5.1}
+VERSION_CODE=${2:-220}
+VERSION_NAME=${3:-2.0}
 
 S2A=${S2A:-$PRODUCT/game.s2a}
 [ -f "$S2A" ] || { echo "game.s2a 不存在：$S2A" >&2; exit 1; }
@@ -37,13 +37,13 @@ mkdir -p "$STAGE"
 
 # launch.json 必须写 embedded=true，否则装到新设备上会跳去"导入 game.s2a"。
 # 优先沿用已发布完整版的描述符，保证 total_bytes/bundle_id 与前作一致。
-LAUNCH_SRC=""
-for candidate in $(ls -t "$WORKSPACE"/dist/BigBrainAcademy-*-full.apk 2>/dev/null); do
-    LAUNCH_SRC=$candidate
-    break
-done
-if [ -f "$LAUNCH_SRC" ] && unzip -p "$LAUNCH_SRC" assets/launch.json >"$STAGE/launch.json" 2>/dev/null; then
-    echo "launch.json: 沿用 $LAUNCH_SRC"
+# launch.json 的 bundle_id 必须等于 game.s2a 里 index.json 的 SHA-256，
+# BundleInstaller 会当场比对，不一致就判包损坏。所以**只能**由本目录的
+# package.json 生成；千万别沿用上一个发布包的 launch.json —— 换游戏版本
+# （比如合入 UPD）后 bundle_id 一定变，沿用等于主动把包装坏。
+if [ -f "$PRODUCT/launch.json" ]; then
+    cp "$PRODUCT/launch.json" "$STAGE/launch.json"
+    echo "launch.json: 取自 $PRODUCT/launch.json"
 else
     python3 - "$PRODUCT" "$STAGE/launch.json" <<'PY'
 import json, sys
@@ -55,6 +55,16 @@ json.dump(out, open(sys.argv[2], 'w'))
 PY
     echo "launch.json: 由 package.json 生成"
 fi
+# 交叉校验：launch.json 的 bundle_id 必须能在 game.s2a 的 index.json 上复现。
+python3 - "$S2A" "$STAGE/launch.json" <<'PY'
+import hashlib, json, sys, zipfile
+want = json.load(open(sys.argv[2]))['bundle_id']
+with zipfile.ZipFile(sys.argv[1]) as z:
+    got = hashlib.sha256(z.read('index.json')).hexdigest()
+if want != got:
+    raise SystemExit(f'bundle_id 不匹配：launch.json={want} game.s2a={got}')
+print('bundle_id 校验通过:', want[:16] + '…')
+PY
 grep -q '"embedded": true' "$STAGE/launch.json" || { echo "launch.json 未标记 embedded" >&2; exit 1; }
 
 cp "$BUNDLES" "$STAGE/shader-bundles.zip"

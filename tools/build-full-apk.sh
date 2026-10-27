@@ -19,9 +19,12 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORKSPACE=$(cd "$ROOT/.." && pwd)
 
-PRODUCT=${1:-$WORKSPACE/s2a-out-diag/0100620012d6e000-v0}
-VERSION_CODE=${2:-220}
-VERSION_NAME=${3:-2.0}
+# 默认产物指向 s2a-out-110：那是已合入官方 1.1.0 更新包（UPD v65536）的 game.s2a。
+# 别指回 s2a-out-diag —— 那是更新前的基础版内容，用它打出来的包会"看起来是新版本、
+# 实际跑旧内容"。带 UPD 的目录靠 package.json 的 version=65536 区分。
+PRODUCT=${1:-$WORKSPACE/s2a-out-110/0100620012d6e000-v65536}
+VERSION_CODE=${2:-221}
+VERSION_NAME=${3:-2.0.1}
 
 S2A=${S2A:-$PRODUCT/game.s2a}
 [ -f "$S2A" ] || { echo "game.s2a 不存在：$S2A" >&2; exit 1; }

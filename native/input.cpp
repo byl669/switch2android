@@ -204,6 +204,13 @@ uint64_t nothing(R){return 0;}
 static void fill_touch_states(R r,int max,int n) {
     read_touch_n(r,max);
     if(n<=1) return;
+    // Only the plural form is worth logging: the crash proves at least one caller
+    // asks for two records, and a run needs to show which screens those are.
+    // Logging the singular form too would burn the budget during startup.
+    {   static std::atomic<unsigned> logged{0};
+        if(logged.fetch_add(1,std::memory_order_relaxed)<8)
+            ot2_host_log("HID_TOUCH_STATES n=%d max=%d record=%#zx",n,max,0x10+sizeof(TouchPoint)*size_t(max));
+    }
     if(n>16) n=16;
     const size_t size=0x10+sizeof(TouchPoint)*size_t(max);
     auto* base=reinterpret_cast<unsigned char*>(static_cast<uintptr_t>(r[0]));
@@ -211,9 +218,6 @@ static void fill_touch_states(R r,int max,int n) {
         memcpy(base+size*size_t(i),base,size);
         reinterpret_cast<TouchState*>(base+size*size_t(i))->sample-=int64_t(i);
     }
-    static std::atomic<unsigned> logged{0};
-    if(logged.fetch_add(1,std::memory_order_relaxed)<4)
-        ot2_host_log("HID_TOUCH_STATES n=%d max=%d record_size=%#zx",n,max,size);
 }
 // The touch template N is part of the symbol name, and a title picks whichever
 // instantiation its SDK was built with. Answering only one of them leaves every

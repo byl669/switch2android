@@ -189,16 +189,42 @@ uint64_t read_touch_n(R r,int max) {
     return 0;
 }
 uint64_t nothing(R){return 0;}
+// GetTouchScreenStates<max>(states, count) fills up to `count` *consecutive*
+// TouchScreenState<max> records, newest first. We used to write only record 0
+// and leave the rest of the caller's buffer untouched, which is whatever the
+// caller's stack happened to hold. Titles do use the second record: the one
+// that crashed did
+//     ldrsw x12,[sp,#0x298]   ; 0x298 = 0x290 (one TouchScreenState<16>) + 8
+//     ldr   w20,[x3,#0xc]    ; x3 advances 0x28 per iteration
+// so an uninitialised record[1].count (0x31c9d0bc in the 09:17 crash) became a
+// 835-million-iteration loop that walked off the 0x520-byte frame, into the
+// guard page, and faulted at main+0x5b74a4. Fill every record instead: the same
+// instantaneous state with the sample counter stepped back, which is what
+// consecutive scans of a finger resting on the panel look like.
+static void fill_touch_states(R r,int max,int n) {
+    read_touch_n(r,max);
+    if(n<=1) return;
+    if(n>16) n=16;
+    const size_t size=0x10+sizeof(TouchPoint)*size_t(max);
+    auto* base=reinterpret_cast<unsigned char*>(static_cast<uintptr_t>(r[0]));
+    for(int i=1;i<n;++i) {
+        memcpy(base+size*size_t(i),base,size);
+        reinterpret_cast<TouchState*>(base+size*size_t(i))->sample-=int64_t(i);
+    }
+    static std::atomic<unsigned> logged{0};
+    if(logged.fetch_add(1,std::memory_order_relaxed)<4)
+        ot2_host_log("HID_TOUCH_STATES n=%d max=%d record_size=%#zx",n,max,size);
+}
 // The touch template N is part of the symbol name, and a title picks whichever
 // instantiation its SDK was built with. Answering only one of them leaves every
 // other call falling through to the real hid service.
 #define OT2_TOUCH(N) \
     uint64_t read_touch_##N(R r){return read_touch_n(r,N);} \
-    uint64_t read_touches_##N(R r){if(int32_t(r[1])<=0)return 0;read_touch_n(r,N);return 1;}
+    uint64_t read_touches_##N(R r){const int32_t n=int32_t(r[1]);if(n<=0)return 0;fill_touch_states(r,N,n);return 1;}
 OT2_TOUCH(1) OT2_TOUCH(2) OT2_TOUCH(3) OT2_TOUCH(4) OT2_TOUCH(5) OT2_TOUCH(6) OT2_TOUCH(7) OT2_TOUCH(8)
 OT2_TOUCH(9) OT2_TOUCH(10) OT2_TOUCH(11) OT2_TOUCH(12) OT2_TOUCH(13) OT2_TOUCH(14) OT2_TOUCH(15) OT2_TOUCH(16)
 uint64_t read_touch(R r){return read_touch_n(r,16);}
-uint64_t read_touches(R r){if(int32_t(r[1])<=0)return 0;read_touch_n(r,16);return 1;}
+uint64_t read_touches(R r){const int32_t n=int32_t(r[1]);if(n<=0)return 0;fill_touch_states(r,16,n);return 1;}
 uint64_t vibration_absent(R r){*reinterpret_cast<bool*>(r[0])=false;return 0;}
 uint64_t vibration_batch(R r){
     // Permission is disabled for this host (the same capability as D2R).

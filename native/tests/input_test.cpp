@@ -60,10 +60,31 @@ int main(){try{
     ot2::touch_cancel();read();require(t.count==2&&t.points[0].attributes==2&&t.points[1].attributes==2,"cancel ends sampled contacts");
     read();require(t.count==0,"cancel leaves no stuck touches");
     for(int i=0;i<17;i++)event(A::down,i,800,500);
-    require(call(many,{address(&t),16})==1&&t.count==16,"at most sixteen fingers, one newest state");
+    // count is the number of *records*, not the point capacity: asking for one
+    // record still reports all sixteen fingers. (It used to be 16 here, which
+    // only worked because the old handler ignored count and filled record 0.)
+    require(call(many,{address(&t),1})==1&&t.count==16,"at most sixteen fingers, one newest state");
     ot2::touch_cancel();read();read();require(t.count==0,"capacity saturation clears");
     ot2::touch_display_size(4,3);event(A::down,1,100,500);read();require(t.count==0,"pillarbox down is ignored for actual source aspect");
     event(A::down,1,800,500);read();require(t.count==1&&t.points[0].x==640,"non-widescreen image mapping");
     ot2::touch_cancel();read();read();
+    // Regression: GetTouchScreenStates<16>(states, 2) must initialise *both*
+    // records. Record 1 used to be left as whatever the caller's stack held, and
+    // the title reads its count as a loop bound — 0x31c9d0bc in the field crash —
+    // then walks 24 entries at 0x28 apiece past the end of its 0x520-byte frame,
+    // into the guard page, and faults at main+0x5b74a4 (ldr w20,[x3,#0xc]).
+    // Poison the buffer first so an unwritten record cannot pass by luck.
+    {
+        std::array<Touch,2> two;
+        memset(two.data(),0xA5,sizeof(two));
+        ot2::touch_cancel();read();read();
+        require(call(many,{address(two.data()),2})==1,"two-state read succeeds");
+        for(int i=0;i<2;++i){
+            const int c=two[size_t(i)].count;
+            require(c>=0&&c<=16,"every requested touch record is initialised");
+        }
+        require(two[1].sample!=int64_t(0xA5A5A5A5A5A5A5A5),"second record was written");
+        require(two[1].sample<two[0].sample,"older record carries the earlier sample");
+    }
     std::cout<<"Input capability, vibration and touchscreen lifecycle regression passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
